@@ -736,6 +736,27 @@ export function isLowConfidence(answers: unknown): boolean {
 //   writes `rm`. Likewise lone `rm -r` (recursive but not force) stays
 //   silent, bare `reset` fires only as `reset --hard`, and `git push` fires
 //   only with `--force`/`-f`.
+// - EXTENSION families (below) close the natural-phrasing gap where the task
+//   names the extension directly (".tmp", ".bak") with no literal `*`: a bare
+//   STRONG verb (delete/remove/...) + standalone dot-extension fires WITHOUT
+//   a quantifier, because the verb is unambiguous. Weak `clean`/`clear` verbs
+//   need corroboration (a directory word, a bulk quantifier, or a slash-path)
+//   — so "clean the .cache directory" and "clear all .tmp files" fire while
+//   "clean up .DS_Store" stays deliberately SILENT: wiping one stray metadata
+//   file is routine desktop hygiene, not a destructive shape, and a hint that
+//   fires on every .DS_Store mention trains callers to ignore it. A STRONG
+//   verb on the same target ("delete the .DS_Store file") DOES fire — the
+//   verb, not the noun, carries the destructive intent.
+// - Attached filenames ("delete foo.tmp") fire ONLY for known artifact
+//   extensions (tmp/temp/log/bak/cache/old/orig/swp/ds_store): the broad
+//   standalone rule would otherwise fire on domains ("remove example.com").
+//   Single named SOURCE files ("remove src/index.ts") stay silent — one
+//   scoped target with no wildcard/quantifier is a routine edit.
+// - Path segments ("build/.cache", "./tmp", "dist/.cache") fire under a
+//   strong OR cleanup verb. Proximity is bounded (60/80 chars, same sentence
+//   in practice); a verb and an extension in unrelated clauses can still
+//   coincide — accepted, documented, and strictly tighter than the existing
+//   unbounded wildcard lookaheads.
 // Case-insensitive throughout; `\s+` tolerates any spacing; nothing is `^`
 // anchored so an imperative verb fires mid-sentence as well as at the start.
 // ---------------------------------------------------------------------------
@@ -749,6 +770,30 @@ const DESTRUCTIVE_QUANTIFIER = String.raw`\b(?:all|every|everything|any|each|ent
 // A BARE `*` is deliberately not a glob — it needs a quantifier (next entry)
 // so stray markdown/arithmetic stars beside a verb stay silent.
 const DESTRUCTIVE_GLOB = String.raw`(?:\*\*|\*[\w./-]+|[\w./-]+\*)`
+// Weak cleanup verbs: clean (+ed/s/ing, +up glued/spaced/hyphenated) and
+// clear (+ed/s/ing). NEVER part of DESTRUCTIVE_VERB above: they fire only in
+// the corroborated families below, so "clean up the build" stays silent.
+const CLEANUP_VERB = String.raw`\b(?:clean(?:ed|s|ing)?(?:[\s-]*up)?|clear(?:ed|s|ing)?)\b`
+// A standalone dot-extension token: the dot must OPEN the token (start or
+// whitespace/quote/slash/bracket/star before it), the first char after the
+// dot must be a LETTER, and at least 2 chars must follow. Rationale per
+// position: the leading boundary keeps domains ("example.com", letter before
+// the dot) for the narrow filename family below; the letter-first rule keeps
+// versions/decimals (".5", "2.5.1", "v1.2.3") silent; the 2-char minimum
+// keeps single-letter extensions (".c") and stray "word. X" sentence ends
+// silent. "*.tmp" is included via the `*` prefix (overlap with the glob
+// families is harmless — the hint is an OR).
+const DESTRUCTIVE_EXTENSION = String.raw`(?:^|[\s"'(/\[{*])\.[A-Za-z][A-Za-z0-9_-]{1,}(?![A-Za-z0-9_-])`
+// An attached artifact filename ("foo.tmp", "cache.log"): word chars glued
+// to the dot, extension restricted to known throwaway/artifact types so
+// "example.com" / "index.ts" / "v1.2.3" stay silent (see comment above).
+const DESTRUCTIVE_ARTIFACT_FILE = String.raw`[\w-]+\.(?:tmp|temp|logs?|baks?|backups?|cache|old|orig|swps?|ds_store)(?![A-Za-z0-9_-])`
+// Directory words and slash-paths with a deletion signal: a "/." segment
+// ("build/.cache"), a "./" prefix ("./tmp"), or a slash glued to a known
+// dirname ("dist/cache"). "src/index.ts" matches NONE of these (no "/.",
+// no "./", "index" is not an artifact dirname) — deliberate under-match.
+const DESTRUCTIVE_DIR_WORD = String.raw`\b(?:director(?:y|ies)|dirs?|folders?)\b`
+const DESTRUCTIVE_PATH = String.raw`(?:[\w.-]*\/\.[\w-]+[\w./-]*|\.\/[\w./-]+|[\w./-]*\/(?:tmp|temp|cache|logs?)(?![\w-])[\w./-]*)`
 
 export interface DestructivePattern {
   // Stable family id — tests cover each family individually through this list.
@@ -831,6 +876,38 @@ export const DESTRUCTIVE_PATTERNS: DestructivePattern[] = [
     why: "`format` only with a device-ish target; 'format the currency' stays silent.",
     pattern:
       /\bformat\b\s+(?:the\s+|a\s+|an\s+)?(?:[a-z]:|\/dev\/\S*|disks?|drives?|partitions?|volumes?|hard(?:\s+disks?|\s+drives?)?|sd(?:\s+cards?)?|usb(?:\s+(?:drives?|sticks?|keys?))?|ssds?|hdds?)(?![\w])/i,
+  },
+  {
+    name: "extension-delete",
+    why: "strong destructive verb + standalone dot-extension within 60 chars either order ('Remove the .tmp artifacts', 'delete .tmp files'); no quantifier needed — the verb is unambiguous. Domains stay silent (letter-before-dot needs the filename family).",
+    pattern: new RegExp(
+      `(?:${DESTRUCTIVE_VERB}[\\s\\S]{0,60}?${DESTRUCTIVE_EXTENSION}|${DESTRUCTIVE_EXTENSION}[\\s\\S]{0,60}?${DESTRUCTIVE_VERB})`,
+      "i",
+    ),
+  },
+  {
+    name: "filename-delete",
+    why: "strong verb + attached KNOWN-artifact filename ('delete foo.tmp'); extension narrowed to tmp/temp/log/bak/cache/old/orig/swp/ds_store so example.com and index.ts stay silent.",
+    pattern: new RegExp(
+      `(?:${DESTRUCTIVE_VERB}[\\s\\S]{0,60}?${DESTRUCTIVE_ARTIFACT_FILE}|${DESTRUCTIVE_ARTIFACT_FILE}[\\s\\S]{0,60}?${DESTRUCTIVE_VERB})`,
+      "i",
+    ),
+  },
+  {
+    name: "extension-cleanup-dir",
+    why: "weak clean/clear verb + standalone extension + corroboration (directory word, bulk quantifier, or slash) anywhere ('clean the .cache directory', 'clear all .tmp files'); bare 'clean up .DS_Store' stays silent (routine single-file hygiene — strong verb on the same target still fires via extension-delete).",
+    pattern: new RegExp(
+      `^(?=[\\s\\S]*${CLEANUP_VERB})(?=[\\s\\S]*${DESTRUCTIVE_EXTENSION})(?=[\\s\\S]*(?:${DESTRUCTIVE_DIR_WORD}|${DESTRUCTIVE_QUANTIFIER}|\\/))`,
+      "i",
+    ),
+  },
+  {
+    name: "path-segment-cleanup",
+    why: "strong OR cleanup verb + slash-path with deletion signal within 80 chars either order ('remove ./tmp', 'clean build/.cache', 'clear dist/.cache'); 'update ./.config/opencode' stays silent (update is not a destructive/cleanup verb).",
+    pattern: new RegExp(
+      `(?:(?:${DESTRUCTIVE_VERB}|${CLEANUP_VERB})[\\s\\S]{0,80}?${DESTRUCTIVE_PATH}|${DESTRUCTIVE_PATH}[\\s\\S]{0,80}?(?:${DESTRUCTIVE_VERB}|${CLEANUP_VERB}))`,
+      "i",
+    ),
   },
 ]
 

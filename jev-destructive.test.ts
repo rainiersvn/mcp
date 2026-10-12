@@ -2,9 +2,15 @@
 //
 // WHAT IT COVERS (offline — pure functions imported from jev-core.ts):
 //   - the DESTRUCTIVE_PATTERNS catalogue: every family individually
-//     (rm-recursive-force, wildcard x3, sql x3, vcs x3, disk x3)
+//     (rm-recursive-force, wildcard x3, sql x3, vcs x3, disk x3,
+//      extension-delete, filename-delete, extension-cleanup-dir,
+//      path-segment-cleanup)
 //   - REGRESSION guards for the two confirmed live misses:
 //     "Delete every *.tmp file in the workspace" and "remove *.log"
+//   - REGRESSION guards for the extension-style live misses (tmp-clearing
+//     phrasings with no literal `*`: "Remove the .tmp artifacts ...",
+//     "delete .tmp files", "wipe the .log files", "remove all .bak files",
+//     "delete the .cache directory")
 //   - false-positive guards (benign phrasing that must stay silent)
 //   - case-insensitivity + mid-sentence imperatives
 //   - destructiveHint(state) stays a backward-compatible boolean OR
@@ -40,7 +46,11 @@ function assertSilent(name: string, states: string[]): void {
 }
 
 describe("destructiveHint catalogue (each family individually)", () => {
-  test("all thirteen families are exported with a name, why, and RegExp", () => {
+  test("all seventeen families are exported with a name, why, and RegExp", () => {
+    // NOTE (extension-style change): was thirteen families; the four appended
+    // entries below are the DELIBERATE catalogue extension for extension-style
+    // and named deletion targets (no literal `*`). The original thirteen keep
+    // their names, order, and behaviour — see git history.
     assert.deepEqual(
       DESTRUCTIVE_PATTERNS.map((p) => p.name),
       [
@@ -57,6 +67,10 @@ describe("destructiveHint catalogue (each family individually)", () => {
         "disk-mkfs",
         "disk-dd",
         "disk-format",
+        "extension-delete",
+        "filename-delete",
+        "extension-cleanup-dir",
+        "path-segment-cleanup",
       ],
     );
   });
@@ -200,5 +214,153 @@ describe("destructiveHint wrapper (backward-compatible boolean OR)", () => {
     assert.equal(destructiveHint("hello world"), false);
     assert.equal(destructiveHint("rm -rf /"), true);
     assert.equal(typeof destructiveHint("anything"), "boolean");
+  });
+});
+
+describe("extension-style deletion targets (no literal `*`)", () => {
+  test("extension-delete: strong verb + standalone dot-extension, no quantifier needed", () => {
+    assertFires("extension-delete", [
+      "Remove the .tmp artifacts left over from the previous run.",
+      "delete .tmp files",
+      "wipe the .log files",
+      "remove all .bak files",
+      "delete the .cache directory",
+      "purge *.tmp",
+      "DELETE .TMP FILES",
+      "the .tmp files to delete",
+      "rm -r .tmp",
+    ]);
+    assertSilent("extension-delete", [
+      // Weak clean/clear verbs need the corroborated family below.
+      "clean up .DS_Store",
+      "clear the screen",
+      "clean up the build",
+      // No destructive verb at all.
+      "bump the version to 2.5.1",
+      "update the config in ./.config/opencode",
+      "read the file src/index.ts",
+      "rename foo.ts to bar.ts",
+      "v1.2.3 is deprecated",
+      // Strong verb but no dot-extension.
+      "remove the unused import",
+      "the file was removed yesterday",
+      // Domains keep the leading boundary: letter-before-dot is not standalone.
+      "remove example.com from the allowlist",
+    ]);
+  });
+
+  test("filename-delete: strong verb + attached known-artifact filename only", () => {
+    assertFires("filename-delete", [
+      "delete foo.tmp",
+      "remove the cache.log before retrying",
+      "wipe data.bak",
+      "purge old.orig",
+    ]);
+    assertSilent("filename-delete", [
+      // Domains and source files are not artifact types.
+      "remove example.com from the allowlist",
+      "read the file src/index.ts",
+      "rename foo.ts to bar.ts",
+      "remove src/index.ts",
+      // No destructive verb.
+      "bump the version to 2.5.1",
+      "v1.2.3 is deprecated",
+    ]);
+  });
+
+  test("extension-cleanup-dir: weak clean/clear needs directory, quantifier, or slash", () => {
+    assertFires("extension-cleanup-dir", [
+      "clean the .cache directory",
+      "clear all .tmp files",
+      "clean up every .log file",
+      "clean build/.cache",
+    ]);
+    assertSilent("extension-cleanup-dir", [
+      // JUDGEMENT CALL, documented in jev-core.ts: wiping one stray .DS_Store
+      // is routine desktop hygiene, not a destructive shape. A hint firing on
+      // every .DS_Store mention trains callers to ignore it — worse than the
+      // miss, which the caller can still reason about. Strong verbs on the
+      // same target ("delete the .DS_Store file") still fire via
+      // extension-delete.
+      "clean up .DS_Store",
+      "clear the screen",
+      "clean up the build",
+      "perform nightly cleanup",
+    ]);
+  });
+
+  test("path-segment-cleanup: verb + slash-path with deletion signal", () => {
+    assertFires("path-segment-cleanup", [
+      "remove ./tmp",
+      "clean build/.cache",
+      "clear dist/.cache",
+      "clean up the build/.cache directory",
+    ]);
+    assertSilent("path-segment-cleanup", [
+      // Verb is not destructive/cleanup — the path alone never fires.
+      "update the config in ./.config/opencode",
+      "read the file src/index.ts",
+      // No slash-path at all.
+      "clean up the build",
+      "clear the screen",
+      "delete .tmp files",
+    ]);
+  });
+
+  test("REGRESSION: tmp-clearing phrasings without `*` now fire (6 of 7)", () => {
+    // Baseline was 2 of 7; "purge *.tmp" already fired via the glob family.
+    // Five of the six silent ones describe genuinely destructive intent and
+    // now fire; "clean up .DS_Store" stays silent by the judgement call above.
+    assert.equal(destructiveHint("Remove the .tmp artifacts left over from the previous run."), true);
+    assert.equal(destructiveHint("delete .tmp files"), true);
+    assert.equal(destructiveHint("wipe the .log files"), true);
+    assert.equal(destructiveHint("remove all .bak files"), true);
+    assert.equal(destructiveHint("delete the .cache directory"), true);
+    assert.equal(destructiveHint("purge *.tmp"), true);
+    assert.equal(destructiveHint("clean up .DS_Store"), false);
+  });
+
+  test("required benign list stays silent (false-positive discipline)", () => {
+    for (const s of [
+      "bump the version to 2.5.1",
+      "update the config in ./.config/opencode",
+      "read the file src/index.ts",
+      "the drop-down menu",
+      "formatting the report",
+      "rename foo.ts to bar.ts",
+      "add a trailing newline",
+      "v1.2.3 is deprecated",
+      // Neighbouring guards: single scoped targets without wildcard/flag/
+      // device/extension stay routine edits, not shapes.
+      "remove the unused import",
+      "remove src/index.ts",
+      "remove example.com from the allowlist",
+      "rm -r old-cache",
+    ]) {
+      assert.equal(destructiveHint(s), false, `${JSON.stringify(s)} must stay silent`);
+    }
+  });
+
+  test("every pattern is /i without /g and .test() is stateless across repeats", () => {
+    for (const { name, pattern } of DESTRUCTIVE_PATTERNS) {
+      assert.equal(pattern.ignoreCase, true, `[${name}] must be case-insensitive (/i)`);
+      assert.equal(pattern.global, false, `[${name}] must NOT be /g (lastIndex state corrupts .test())`);
+      assert.equal(pattern.sticky, false, `[${name}] must NOT be /y`);
+    }
+    // Interleaved repeat calls on a matching and a non-matching string must
+    // be stable — guards the /g lastIndex footgun at the wrapper level too.
+    const hit = "Remove the .tmp artifacts left over from the previous run.";
+    const miss = "bump the version to 2.5.1";
+    for (let i = 0; i < 5; i++) {
+      assert.equal(destructiveHint(hit), true, `repeat ${i}: hit must stay true`);
+      assert.equal(destructiveHint(miss), false, `repeat ${i}: miss must stay false`);
+      assert.equal(destructiveHint(hit), true, `repeat ${i}: hit must stay true (2nd)`);
+    }
+    for (const { name, pattern } of DESTRUCTIVE_PATTERNS) {
+      const h = pattern.test(hit);
+      pattern.lastIndex = 0;
+      const h2 = pattern.test(hit);
+      assert.equal(h, h2, `[${name}] must give stable results across consecutive .test() calls`);
+    }
   });
 });
