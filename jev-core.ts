@@ -379,8 +379,12 @@ export function serializeState(state?: unknown, context?: unknown): string {
 // TTL CACHE + BOUNDED RETRY + RESPONSE ENVELOPE
 //
 // Cache: the expert CHOICE is stable across repeats (see score_semantics in
-// discoverPayload) so it is safe to cache 6h; scores jitter (sd ~0.025) and
-// cannot cross a bucket boundary in 60s, so scores are cached 60s.
+// discoverPayload) so PURE-CHOICE requests are safe to cache 6h; scores
+// jitter (sd ~0.025) and cannot cross a bucket boundary in 60s, so scores
+// are cached 60s. noul values have NO measured-stability evidence and are
+// typically safety verdicts, so any request containing a score OR noul
+// question uses the 60s TTL — the 6h TTL must never be applied to score or
+// noul answers without evidence.
 // IN-MEMORY ONLY: one stdio process per session, high key cardinality, short
 // score TTL — an on-disk cache file adds a corruption failure mode for no
 // gain. Do NOT "improve" this into a file cache.
@@ -438,10 +442,25 @@ export function cacheKeyFor(state: string, questions: unknown): string {
 }
 
 // "wants a score" = the questions object contains an entry with type "score".
+// Kept as a compatible export; the TTL decision uses wantsFresh below.
 export function wantsScore(questions: unknown): boolean {
   if (questions === null || typeof questions !== "object" || Array.isArray(questions)) return false
   return Object.values(questions as Record<string, unknown>).some(
     (q) => q !== null && typeof q === "object" && !Array.isArray(q) && (q as Record<string, unknown>).type === "score",
+  )
+}
+
+// "wants fresh" = the questions object contains an entry with type "score"
+// OR "noul": both need the 60s TTL. Only a request whose questions are
+// purely "choice" (no score, no noul) may use the 6h choice TTL.
+export function wantsFresh(questions: unknown): boolean {
+  if (questions === null || typeof questions !== "object" || Array.isArray(questions)) return false
+  return Object.values(questions as Record<string, unknown>).some(
+    (q) =>
+      q !== null &&
+      typeof q === "object" &&
+      !Array.isArray(q) &&
+      ((q as Record<string, unknown>).type === "score" || (q as Record<string, unknown>).type === "noul"),
   )
 }
 
@@ -768,13 +787,18 @@ export async function decide(state: string, questions?: unknown, deps?: DecideDe
     log("decide.start", { state_chars: state.length, caller_questions: callerSupplied })
     const q = questions ?? defaultQuestions()
     const key = cacheKeyFor(state, q)
-    const needScore = wantsScore(q)
+    // TTL DECISION — by question TYPE, not just "is there a score". The 6h
+    // TTL rests on measured expert-CHOICE stability ONLY, so it applies to
+    // pure-choice requests alone. Any score OR noul question forces the 60s
+    // TTL: noul values have no stability evidence and are typically safety
+    // verdicts, which must never be served stale for hours.
+    const needFresh = wantsFresh(q)
 
     // Cache lookup AFTER validation, BEFORE any network.
     const held = jevCache.get(key)
     const heldAge = held ? t0 - held.at : -1
     const heldUsable = !!held && heldAge < CHOICE_TTL_MS
-    if (held && heldAge < SCORE_TTL_MS && needScore) {
+    if (held && heldAge < SCORE_TTL_MS && needFresh) {
       touchCache(key, held)
       const text = buildEnvelope(
         held.upstream,
@@ -784,7 +808,7 @@ export async function decide(state: string, questions?: unknown, deps?: DecideDe
       log("decide.done", { state_chars: state.length, response_chars: text.length, cached: "full" })
       return text
     }
-    if (held && heldAge < CHOICE_TTL_MS && !needScore) {
+    if (held && heldAge < CHOICE_TTL_MS && !needFresh) {
       touchCache(key, held)
       const text = buildEnvelope(
         held.upstream,
@@ -986,7 +1010,7 @@ export function discoverPayload() {
       confidence_1: "commitment, not certainty.",
       confidence_0: "max uncertainty.",
       scores: "bucket decimals: <=1 low, <=2 medium, >2 high (sd ~0.025).",
-      expert_choice: "stable/cacheable; scores jitter.",
+      expert_choice: "choice stable/6h; score/noul 60s.",
       blind_spot:
         "globs ~2.1 vs 'rm -rf /' ~2.96; never gate on one score.",
     },
