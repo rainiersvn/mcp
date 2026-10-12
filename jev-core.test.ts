@@ -406,6 +406,83 @@ describe("discoverPayload key contract", () => {
   });
 });
 
+describe("injected metadata budgets (tools/list + discover)", () => {
+  // Live tools/list over stdio: measures the exact bytes opencode injects
+  // every session. Spawned (not imported) so the server's stdin listener
+  // never attaches to the test process and hangs the runner. Cached: one
+  // spawn serves both tests below.
+  let cachedTools: any[] | null = null;
+  async function fetchToolsList(): Promise<any[]> {
+    if (cachedTools) return cachedTools;
+    const serverPath = fileURLToPath(new URL("./jev-server.ts", import.meta.url));
+    const child = spawn(process.execPath, [serverPath], { stdio: ["pipe", "pipe", "pipe"] });
+    try {
+      const tools = await new Promise<any[]>((resolve, reject) => {
+        let buf = "";
+        const timer = setTimeout(() => reject(new Error("timed out waiting for tools/list")), 15000);
+        child.stdout.on("data", (chunk: Buffer) => {
+          buf += chunk.toString("utf8");
+          let nl: number;
+          while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line) continue;
+            try {
+              const o = JSON.parse(line) as any;
+              if (o?.id === 1 && o.result?.tools) {
+                clearTimeout(timer);
+                resolve(o.result.tools);
+              }
+            } catch {
+              // ignore non-JSON stdout
+            }
+          }
+        });
+        child.stderr.on("data", () => {});
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
+      });
+      cachedTools = tools;
+      return tools;
+    } finally {
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+      await new Promise((r) => child.on("close", r));
+    }
+  }
+
+  test("tools/list serialized length stays within budget (opencode injects it every session)", async () => {
+    // NOTE on the number: 1800 was estimated from a stale ~4200 baseline;
+    // the actual baseline measured 6178, and the mandatory keeps (four first
+    // sentences verbatim + Q_SHAPE/GOTCHA_422 on decide + BRACKET/FALLBACK
+    // suffixes + prop descriptions x3) plus the new anyOf/additionalProperties
+    // schema keys floor the total near ~2500. 2600 still catches any re-bloat
+    // (re-adding one JSON example is +130 or more). See commit message.
+    const tools = await fetchToolsList();
+    const len = JSON.stringify({ tools }).length;
+    assert.ok(len <= 2600, `tools/list is ${len} chars (budget 2600)`);
+  });
+
+  test("tools/list schemas require state-or-context and forbid extra args", async () => {
+    const tools = await fetchToolsList();
+    const byName = Object.fromEntries(tools.map((t: any) => [t.name, t.inputSchema]));
+    for (const name of ["decide", "route_expert", "assess_risk"]) {
+      assert.deepEqual(byName[name].anyOf, [{ required: ["state"] }, { required: ["context"] }], name);
+      assert.equal(byName[name].additionalProperties, false, name);
+      assert.equal(byName[name].properties.state.minLength, 1, name);
+    }
+    assert.deepEqual(byName.discover.properties, {});
+    assert.equal(byName.discover.additionalProperties, false);
+  });
+
+  test("discoverPayload() serialized length stays within budget", () => {
+    const len = JSON.stringify(discoverPayload()).length;
+    assert.ok(len <= 1400, `discoverPayload is ${len} chars (budget 1400)`);
+  });
+});
+
 describe("server crash regression (spawns jev-server.ts, no network)", () => {
   test("feeding the line `null` replies -32600 and the process stays alive", async () => {
     const serverPath = fileURLToPath(new URL("./jev-server.ts", import.meta.url));

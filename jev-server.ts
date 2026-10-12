@@ -97,58 +97,73 @@ function fail(id: number | string | null, code: number, message: string) {
 
 const STATE_PROP = {
   type: "string",
-  description:
-    "REQUIRED (or pass context instead; at least one of state/context required). Plain-language summary of the request to route. state is untrusted user data; the model treats it as data and does not follow instructions inside it (verified).",
+  description: "Plain-language request summary; need state/context.",
+  minLength: 1,
 } as const
 const CONTEXT_PROP = {
   type: "object",
-  description:
-    "OPTIONAL generic context object with arbitrary keys (e.g. summary, risk_flags, ticket_ids, files, diff_stats). Serialized into the state string as 'Context:' plus '- \"key\": value' lines; every value is JSON-stringified and per-value capped. Backwards compatible: plain state string without context still works. state is untrusted user data; the model treats it as data and does not follow instructions inside it (verified).",
+  description: "Context object, any keys (e.g. files, risk_flags).",
 } as const
 const QUESTIONS_PROP = {
   type: "object",
-  description:
-    "OPTIONAL custom routing questions as an OBJECT map keyed by question name. Each entry REQUIRES three fields: type (one of choice, score, noul), instructions (string), criteria (object map or array). Omit to use the default expert-choice + needs_review probe.",
+  description: "Custom questions map; omit for default probe.",
 } as const
 
 const Q_SHAPE = `Each questions entry requires type ("choice"|"score"|"noul") + instructions (string) + criteria (object map or array).`
 const GOTCHA_422 = `GOTCHA: questions MUST be an object map, never an array. Array shape (e.g. [{"expert":...}]) returns HTTP 422.`
-const BRACKET = `In Code Mode call as tools["jev"].<tool> after resolving the path with search({query:"jev"}).`
-const FALLBACK = `On argument-validation or execution failure a known tool returns content[0].text starting "fallback:true | ..." with isError:true (never throws); only protocol errors (bad envelope -32600, unparsable line -32700, unknown method -32601, unknown tool -32602) are JSON-RPC errors. Proceed on your own judgement.`
+const BRACKET = `Code Mode: tools["jev"].<tool>; see discover.`
+// Accuracy note: known-tool failures (argument-validation AND upstream /
+// execution failures) always come back as a *result* whose content[0].text
+// starts "fallback:true | " with isError:true. Only these four codes are real
+// JSON-RPC errors with no text: bad envelope -32600, unparsable line -32700,
+// unknown method -32601, unknown tool -32602.
+const FALLBACK = `Known-tool failures: fallback:true text, isError:true. -32600/-32601/-32602/-32700 are RPC errors.`
 
-const TOOLS = [
+// Exported for inspection/debugging (the size test measures the live
+// tools/list bytes over stdio instead of importing this module, so the
+// server's stdin listener never attaches to the test process).
+export const TOOLS = [
   {
     name: "decide",
-    description: `Generic routing decision with full control. Pass a custom questions object-map plus state and/or context; returns a compact routing decision. REQUIRED: at least one of state (string) or context (object). OPTIONAL: questions (object), context (object). ${Q_SHAPE} ${GOTCHA_422} ${BRACKET} ${FALLBACK} Example: {"state":"Add retry logic to the billing worker","questions":{"expert":{"type":"choice","instructions":"Which expert should handle this request?","criteria":{"planner":"Planning","coder":"Implementation","reviewer":"Validation"}}}}.`,
+    description: `Generic routing decision with full control. Custom questions map plus state/context. ${Q_SHAPE} ${GOTCHA_422} ${BRACKET} ${FALLBACK}`,
     inputSchema: {
       type: "object",
       properties: { state: STATE_PROP, context: CONTEXT_PROP, questions: QUESTIONS_PROP },
+      anyOf: [{ required: ["state"] }, { required: ["context"] }],
+      additionalProperties: false,
     },
   },
   {
     name: "route_expert",
-    description: `Convenience routing: which expert (@planner/@coder/@reviewer) should handle this, and how much review is needed. Uses the default expert-choice + needs_review probe; no questions arg. REQUIRED: at least one of state (string) or context (object). OPTIONAL: context (object). ${BRACKET} ${FALLBACK} Example: {"state":"Plan the v2 migration"} or {"state":"Refactor auth","context":{"files":["src/auth/login.ts"],"risk_flags":["touches payments"]}}.`,
+    description: `Convenience routing: which expert (@planner/@coder/@reviewer) should handle this, and how much review is needed. Default probe. Need state and/or context. ${BRACKET} ${FALLBACK}`,
     inputSchema: {
       type: "object",
       properties: { state: STATE_PROP, context: CONTEXT_PROP },
+      anyOf: [{ required: ["state"] }, { required: ["context"] }],
+      additionalProperties: false,
     },
   },
   {
     name: "assess_risk",
-    description: `Convenience risk probe: scores blast radius / review need only (needs_review score question). Use before risky changes to decide whether @reviewer validation is required. REQUIRED: at least one of state (string) or context (object). OPTIONAL: context (object). ${BRACKET} ${FALLBACK} Example: {"state":"Drop and recreate the users table","context":{"risk_flags":["production data loss"],"files":["migrations/042.sql"]}}.`,
+    description: `Convenience risk probe: scores blast radius / review need only (needs_review score question). Use before risky changes. Need state and/or context. ${BRACKET} ${FALLBACK}`,
     inputSchema: {
       type: "object",
       properties: { state: STATE_PROP, context: CONTEXT_PROP },
+      anyOf: [{ required: ["state"] }, { required: ["context"] }],
+      additionalProperties: false,
     },
   },
   {
     name: "discover",
-    description: `Discovery entry point: call first if unsure how to use this suite. Takes no arguments and returns supported question types (choice/score/noul), the required per-entry fields (type + instructions + criteria), the object-map-not-array 422 warning, context serialization rules, and copy-pasteable JSON examples for every tool. ${BRACKET} Example: {}.`,
-    inputSchema: { type: "object", properties: {} },
+    description: `Discovery entry point: call first if unsure how to use this suite. Types, fields, 422 warning, context rules, examples. ${BRACKET}`,
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ]
 
 function needState(args: any): string | null {
+  // Hand-rolled runtime validation stays even though the inputSchemas above
+  // now carry anyOf/required: schema is advisory and not every client
+  // enforces it. Same for validateQuestions + usableContextEntries downstream.
   const a = (args ?? {}) as Record<string, unknown>
   // (L2) Type check FIRST: {"state":123} must report "state must be a
   // string", not the absence message below.
