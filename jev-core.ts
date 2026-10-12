@@ -704,17 +704,144 @@ export function isLowConfidence(answers: unknown): boolean {
   }
 }
 
+// ---------------------------------------------------------------------------
+// DESTRUCTIVE-SHAPE HINT (boolean only — never an auto-escalation).
+//
+// destructiveHint(state) is true when the caller-visible state carries the
+// SHAPE of a destructive request (recursive delete, wildcard wipe, DROP
+// TABLE, force-push, disk format, ...). It only sets `_jev.destructive_hint`
+// so the CALLER seeks a second signal before acting; the wrapper itself never
+// makes the decision.
+//
+// FALSE-POSITIVE TRADE-OFF — this hint deliberately UNDER-matches (a hint
+// that cries wolf gets ignored), so every family below prefers silence on
+// ambiguous phrasing:
+// - A destructive verb alone never fires: "remove the unused import" is
+//   FALSE because a single scoped target with no wildcard/flag/device is a
+//   routine code edit. The wildcard families need verb + `*`/glob (a bare
+//   `*` additionally needs a bulk quantifier), so "the file was removed
+//   yesterday" (no `*`) is FALSE. Markdown emphasis (`*word*`) next to a
+//   destructive verb CAN fire — accepted: verb + star is rare in benign text.
+// - `drop` fires only on adjacent `drop table|database` (canonical SQL
+//   shape), so "drop-down menu" / "add a dropdown" stay FALSE. Prose with a
+//   gap ("drop and recreate the users table") stays silent too — the review
+//   score, not the hint, owns those.
+// - `truncate` fires on the bare word, so "truncate the audit log" fires
+//   while "truncated response" does not (the trailing `d` breaks `\b`).
+// - `format` fires ONLY with a device-ish target (`C:`, `/dev/...`,
+//   disk/drive/partition/...), so "formatting the report" (no word boundary)
+//   and "I will format the currency" (no device target) stay FALSE.
+// - `clean`/`clear` are NOT destructive verbs here: "clear the screen" and
+//   "clean up the build" are ubiquitous benign prose; anyone meaning `rm -rf`
+//   writes `rm`. Likewise lone `rm -r` (recursive but not force) stays
+//   silent, bare `reset` fires only as `reset --hard`, and `git push` fires
+//   only with `--force`/`-f`.
+// Case-insensitive throughout; `\s+` tolerates any spacing; nothing is `^`
+// anchored so an imperative verb fires mid-sentence as well as at the start.
+// ---------------------------------------------------------------------------
+
+// Shared fragments (String.raw so `\b`/`\s` stay readable at the use site).
+// Verbs cover base + ed/es/ing (`delete`/`deleted`/`deletes`/`deleting`);
+// bare stems never match, and `unlink`/`rm` match as complete words.
+const DESTRUCTIVE_VERB = String.raw`\b(?:rm|delet(?:e|ed|es|ing)|remov(?:e|ed|es|ing)|wip(?:e|ed|es|ing)|purg(?:e|ed|es|ing)|nuk(?:e|ed|es|ing)|unlink(?:ed|s|ing)?)\b`
+const DESTRUCTIVE_QUANTIFIER = String.raw`\b(?:all|every|everything|any|each|entire|whole)\b`
+// A file-ish glob: `*` glued to a name (`*.log`, `file*`, `*.*`) or `**`.
+// A BARE `*` is deliberately not a glob — it needs a quantifier (next entry)
+// so stray markdown/arithmetic stars beside a verb stay silent.
+const DESTRUCTIVE_GLOB = String.raw`(?:\*\*|\*[\w./-]+|[\w./-]+\*)`
+
+export interface DestructivePattern {
+  // Stable family id — tests cover each family individually through this list.
+  name: string
+  // One line on what fires (and what is deliberately excluded).
+  why: string
+  pattern: RegExp
+}
+
+// Testable catalogue: destructiveHint(state) is the OR over these (kept `/i`
+// without `/g`, so .test() is stateless). Add a family here — never inside
+// destructiveHint — so each shape stays individually coverable.
+export const DESTRUCTIVE_PATTERNS: DestructivePattern[] = [
+  {
+    name: "rm-recursive-force",
+    why: "rm carrying both -r and -f, combined (-rf/-fr[-v]) or split (-r -f, any order); lone -r stays silent.",
+    pattern:
+      /\brm\s+-(?=[a-z]*r)(?=[a-z]*f)[a-z]+\b|\brm\s+(?:-{1,2}[a-z]+\s+)*-{1,2}[a-z]*r[a-z]*\s+(?:-{1,2}[a-z]+\s+)*-{1,2}[a-z]*f|\brm\s+(?:-{1,2}[a-z]+\s+)*-{1,2}[a-z]*f[a-z]*\s+(?:-{1,2}[a-z]+\s+)*-{1,2}[a-z]*r/i,
+  },
+  {
+    name: "wildcard-delete-quantified",
+    why: "destructive verb + bulk quantifier + bare `*` in any order ('delete everything *').",
+    pattern: new RegExp(
+      `^(?=[\\s\\S]*${DESTRUCTIVE_VERB})(?=[\\s\\S]*${DESTRUCTIVE_QUANTIFIER})(?=[\\s\\S]*\\*)`,
+      "i",
+    ),
+  },
+  {
+    name: "wildcard-delete-glob",
+    why: "destructive verb + file-ish glob in any order ('remove *.log'); a lone `*` needs a quantifier (above).",
+    pattern: new RegExp(`^(?=[\\s\\S]*${DESTRUCTIVE_VERB})(?=[\\s\\S]*${DESTRUCTIVE_GLOB})`, "i"),
+  },
+  {
+    name: "rm-star",
+    why: "`rm` is never prose, so `rm` + any `*` in any order fires ('rm *').",
+    pattern: /\brm\b[\s\S]*\*|\*[\s\S]*\brm\b/i,
+  },
+  {
+    name: "sql-drop",
+    why: "adjacent canonical `drop table|database`; gapped prose stays silent (the score owns it).",
+    pattern: /\bdrop\s+(?:tables?|databases?)\b/i,
+  },
+  {
+    name: "sql-truncate",
+    why: "bare `truncate` word; 'truncated' is excluded by the trailing boundary.",
+    pattern: /\btruncate\b/i,
+  },
+  {
+    name: "sql-delete-from",
+    why: "adjacent `delete from` (SQL DELETE shape); gapped prose ('delete the file from ...') stays silent.",
+    pattern: /\bdelete\s+from\b/i,
+  },
+  {
+    name: "vcs-force-push",
+    why: "hyphenated `force-push` (pre-existing shape, kept).",
+    pattern: /force-push/i,
+  },
+  {
+    name: "vcs-git-push-force",
+    why: "`git push` with `--force`/`-f` up to a few args away.",
+    pattern: /\bgit\s+push\b(?=[\s\S]{0,80}?(?:\s--force\b|\s-f\b))/i,
+  },
+  {
+    name: "vcs-reset-hard",
+    why: "`reset --hard`; bare `reset` never fires.",
+    pattern: /\breset\s+--hard\b/i,
+  },
+  {
+    name: "disk-mkfs",
+    why: "`mkfs` never appears in benign prose.",
+    pattern: /\bmkfs\b/i,
+  },
+  {
+    name: "disk-dd",
+    why: "`dd` with `of=/dev/...` nearby (device overwrite).",
+    pattern: /\bdd\b(?=[\s\S]{0,200}?\bof\s*=\s*\/dev\/)/i,
+  },
+  {
+    name: "disk-format",
+    why: "`format` only with a device-ish target; 'format the currency' stays silent.",
+    pattern:
+      /\bformat\b\s+(?:the\s+|a\s+|an\s+)?(?:[a-z]:|\/dev\/\S*|disks?|drives?|partitions?|volumes?|hard(?:\s+disks?|\s+drives?)?|sd(?:\s+cards?)?|usb(?:\s+(?:drives?|sticks?|keys?))?|ssds?|hdds?)(?![\w])/i,
+  },
+]
+
 // HINT, not an auto-escalation: true when the caller-visible state carries a
 // destructive shape, forcing the caller to seek a second signal. The wrapper
 // itself never makes the decision.
 export function destructiveHint(state: string): boolean {
-  return (
-    /rm\s+-rf/i.test(state) ||
-    /drop\s+table/i.test(state) ||
-    /\btruncate\b/i.test(state) ||
-    /delete\b[\s\S]*\*/.test(state) ||
-    /force-push/i.test(state)
-  )
+  return DESTRUCTIVE_PATTERNS.some(({ pattern }) => {
+    pattern.lastIndex = 0
+    return pattern.test(state)
+  })
 }
 
 export interface JevMeta {
@@ -1129,22 +1256,22 @@ export function discoverPayload() {
       scores: "bucket decimals: <=1 low, <=2 medium, >2 high (sd ~0.025).",
       expert_choice: "choice stable/6h; score/noul 60s.",
       blind_spot:
-        "globs ~2.1 vs 'rm -rf /' ~2.96; never gate on one score.",
+        "globs ~2.1 vs rm-rf ~2.96; hint rm/glob/drop/format; never gate 1 score",
     },
     answers_note:
       "_jev.answers: choice{choice,conf,probs} score{score,conf,probs,bkt} noul{noul,bkt}.",
     confidence_note:
       "conf<0.5: read probs.",
     batch_note:
-      "batch N/round trip; pool4 max8; bad entries fail per-entry.",
+      "batch N/roundtrip; pool4 max8; bad entries fail alone.",
     recommended_usage:
-      "discover first; assess_risk if risky.",
+      "discover 1st; assess_risk if risky.",
     response_envelope:
       "upstream@root + _jev{format,cached,stale,answers,low_confidence}; else 'fallback:true | '; non-obj raw.",
     code_mode_note:
       "tools[\"jev\"].<t> via search(\"jev\").",
     examples: {
-      decide: { state: "Billing" },
+      decide: { state: "Bill" },
       decide_with_context: {
         state: "Auth",
         context: { files: ["m.sql"] },
