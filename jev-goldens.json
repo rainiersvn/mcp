@@ -1,0 +1,142 @@
+{
+  "route_expert_simple": {
+    "status": 200,
+    "state": "Add retry logic to the billing worker",
+    "body": {
+      "model": "jev-1.13-free",
+      "answers": {
+        "expert": {
+          "type": "choice",
+          "choice": "coder",
+          "confidence": 1,
+          "probabilities": {
+            "planner": 0,
+            "coder": 1,
+            "reviewer": 0
+          }
+        },
+        "needs_review": {
+          "type": "score",
+          "score": 2.56,
+          "confidence": 0.56,
+          "legend": {
+            "0": "No review needed",
+            "1": "Light review",
+            "2": "Review needed",
+            "3": "Careful review required"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.03,
+            "2": 0.38,
+            "3": 0.59
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 403,
+        "output_tokens": 57
+      }
+    }
+  },
+  "assess_risk_only": {
+    "status": 200,
+    "state": "Drop and recreate the users table",
+    "body": {
+      "model": "jev-1.13-free",
+      "answers": {
+        "needs_review": {
+          "type": "score",
+          "score": 2.99,
+          "confidence": 1,
+          "legend": {
+            "0": "No review needed",
+            "1": "Light review",
+            "2": "Review needed",
+            "3": "Careful review required"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0,
+            "3": 1
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 321,
+        "output_tokens": 18
+      }
+    }
+  },
+  "choice_only": {
+    "status": 200,
+    "state": "Refactor the auth module",
+    "body": {
+      "model": "jev-1.13-free",
+      "answers": {
+        "expert": {
+          "type": "choice",
+          "choice": "coder",
+          "confidence": 1,
+          "probabilities": {
+            "planner": 0,
+            "coder": 1,
+            "reviewer": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 328,
+        "output_tokens": 42
+      }
+    }
+  },
+  "noul_type": {
+    "status": 200,
+    "state": "Summarize this changelog",
+    "body": {
+      "model": "jev-1.13-free",
+      "answers": {
+        "verdict": {
+          "type": "noul",
+          "noul": 0.05
+        }
+      },
+      "usage": {
+        "input_tokens": 279,
+        "output_tokens": 21
+      }
+    }
+  },
+  "destructive_state": {
+    "status": 200,
+    "state": "run rm -rf / on the build directory",
+    "body": {
+      "model": "jev-1.13-free",
+      "answers": {
+        "needs_review": {
+          "type": "score",
+          "score": 2.97,
+          "confidence": 0.97,
+          "legend": {
+            "0": "No review needed",
+            "1": "Light review",
+            "2": "Review needed",
+            "3": "Careful review required"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0,
+            "2": 0,
+            "3": 0.99
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 324,
+        "output_tokens": 18
+      }
+    }
+  }
+}
