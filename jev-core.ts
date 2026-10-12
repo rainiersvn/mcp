@@ -552,8 +552,13 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 // Best-effort score extraction for the `bucket` label: a top-level `score`
-// number, any *-score* numeric field, or a nested `{score: n}` one level
-// down (e.g. needs_review: {score: 2.1}). Absent when nothing numeric fits.
+// number, any *-score* numeric field, or a `{score: n}` nested up to
+// MAX_SCORE_DEPTH levels down — the live payload nests it two levels deep at
+// `answers.needs_review.score` (root -> answers -> needs_review). Only a value
+// under a key containing "score" counts; a bare number is accepted ONLY at the
+// top level. Unrelated numerics (confidence, usage token counts) never match.
+// Absent when nothing numeric fits.
+const MAX_SCORE_DEPTH = 3
 export function extractScore(upstream: unknown): number | undefined {
   if (typeof upstream === "number" && Number.isFinite(upstream)) return upstream
   if (upstream === null || typeof upstream !== "object" || Array.isArray(upstream)) return undefined
@@ -561,10 +566,29 @@ export function extractScore(upstream: unknown): number | undefined {
   if (typeof o.score === "number" && Number.isFinite(o.score)) return o.score
   for (const [k, v] of Object.entries(o)) {
     if (/score/i.test(k) && typeof v === "number" && Number.isFinite(v)) return v
-    if (v !== null && typeof v === "object" && !Array.isArray(v)) {
-      const inner = (v as Record<string, unknown>).score
-      if (typeof inner === "number" && Number.isFinite(inner)) return inner
+  }
+  // Bounded BFS for nested {score: n}: prefers shallower matches, guards
+  // cycles via `seen`, and never descends past MAX_SCORE_DEPTH or into arrays.
+  const seen = new Set<object>([o])
+  let frontier: Array<{ obj: Record<string, unknown>; depth: number }> = [{ obj: o, depth: 0 }]
+  while (frontier.length > 0) {
+    const next: Array<{ obj: Record<string, unknown>; depth: number }> = []
+    for (const { obj, depth } of frontier) {
+      if (depth >= MAX_SCORE_DEPTH) continue
+      for (const v of Object.values(obj)) {
+        if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+          const child = v as Record<string, unknown>
+          if (seen.has(child)) continue
+          seen.add(child)
+          if (typeof child.score === "number" && Number.isFinite(child.score)) return child.score
+          for (const [k2, v2] of Object.entries(child)) {
+            if (/score/i.test(k2) && typeof v2 === "number" && Number.isFinite(v2)) return v2
+          }
+          next.push({ obj: child, depth: depth + 1 })
+        }
+      }
     }
+    frontier = next
   }
   return undefined
 }
