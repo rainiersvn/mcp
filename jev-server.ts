@@ -1,13 +1,98 @@
-import { assessRisk, decideWithContext, discoverPayload, routeExpert } from "./jev-core.ts"
+import { assessRisk, decideWithContext, discoverPayload, log, routeExpert } from "./jev-core.ts"
 
 type RpcMsg = { jsonrpc: "2.0"; id?: number | string | null; method?: string; params?: any }
 
+// Process-level backstops: an async throw must NEVER become an unhandled
+// rejection that kills the stdio server (Node >= 15 exits on those). Log the
+// crash to stderr and still emit a valid JSON-RPC error so the client sees a
+// response instead of a dead pipe.
+process.on("unhandledRejection", (reason) => {
+  try {
+    log("handle.crash", {
+      where: "unhandledRejection",
+      error: reason instanceof Error ? reason.message : String(reason).slice(0, 200),
+    })
+  } catch {
+    // never throw from a backstop
+  }
+  try {
+    process.stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32603, message: "unhandled rejection" },
+      }) + "\n",
+    )
+  } catch {
+    // stdout gone — nothing more we can do
+  }
+})
+
+process.on("uncaughtException", (err) => {
+  try {
+    log("handle.crash", {
+      where: "uncaughtException",
+      error: err instanceof Error ? err.message : String(err).slice(0, 200),
+    })
+  } catch {
+    // never throw from a backstop
+  }
+  try {
+    process.stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32603, message: "uncaught exception" },
+      }) + "\n",
+    )
+  } catch {
+    // stdout gone — nothing more we can do
+  }
+})
+
+// An EPIPE on client disconnect currently throws on an unhandled stream event
+// and takes the server down with it. Swallow it (log + carry on) instead.
+process.stdout.on("error", (err) => {
+  try {
+    log("handle.crash", {
+      where: "stdout",
+      error: err instanceof Error ? err.message : String(err).slice(0, 200),
+    })
+  } catch {
+    // never throw from a backstop
+  }
+  // EPIPE means the reader went away; anything else is unexpected but must
+  // still not kill the server via an unhandled 'error' event.
+})
+
 function reply(id: number | string | null, result: unknown) {
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n")
+  try {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n")
+  } catch (e) {
+    try {
+      log("handle.crash", {
+        where: "reply",
+        error: e instanceof Error ? e.message : String(e).slice(0, 200),
+      })
+    } catch {
+      // never throw from a backstop
+    }
+  }
 }
 
 function fail(id: number | string | null, code: number, message: string) {
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n")
+  try {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n")
+  } catch (e) {
+    try {
+      log("handle.crash", {
+        where: "fail",
+        error: e instanceof Error ? e.message : String(e).slice(0, 200),
+      })
+    } catch {
+      // never throw from a backstop
+    }
+  }
 }
 
 const STATE_PROP = {
@@ -72,12 +157,53 @@ function needState(args: any): string | null {
   return null
 }
 
-async function handle(msg: RpcMsg) {
-  const id = (msg.id ?? null) as number | string | null
+async function handle(raw: unknown) {
+  // Backstop correlation when the crash happens before we learn the id.
+  let fallbackId: number | string | null = null
+  let isNotification = false
   try {
+    // (B1) Guard BEFORE any deref: JSON.parse("null") succeeds yielding null,
+    // and arrays / strings / numbers are valid JSON too. None of them has an
+    // `.id` — the old `msg.id` deref here threw, escaping as an unhandled
+    // rejection and killing the process. Reject with -32600 instead.
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      try {
+        log("rpc.invalid", { reason: "non-object-message" })
+      } catch {
+        // never throw from logging
+      }
+      return fail(null, -32600, "invalid request: message must be an object")
+    }
+    const msg = raw as RpcMsg
+    // Non-string (or missing) jsonrpc is a protocol violation, not a method
+    // problem: -32600. Notifications (no id) get silence, not even an error.
+    if (typeof msg.jsonrpc !== "string" || msg.jsonrpc !== "2.0") {
+      try {
+        log("rpc.invalid", {
+          reason: "bad-jsonrpc",
+          method: typeof msg.method === "string" ? msg.method : undefined,
+        })
+      } catch {
+        // never throw from logging
+      }
+      if (msg.id === undefined) return
+      fallbackId = (msg.id ?? null) as number | string | null
+      return fail(fallbackId, -32600, 'invalid request: jsonrpc must be "2.0"')
+    }
+    // (B2) id is read INSIDE the try, after the shape guard above.
+    const id = (msg.id ?? null) as number | string | null
+    fallbackId = id
+    // Notifications carry no id: execute (or ignore) but never reply — a
+    // response with id null to a notification confuses clients.
+    isNotification = msg.id === undefined
+    const done = (fn: () => void) => {
+      if (!isNotification) fn()
+    }
+    const ok = (result: unknown) => done(() => reply(id, result))
+    const err = (code: number, message: string) => done(() => fail(id, code, message))
     switch (msg.method) {
       case "initialize":
-        return reply(id, {
+        return ok({
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
           serverInfo: { name: "jev", version: "2.0.0" },
@@ -85,47 +211,70 @@ async function handle(msg: RpcMsg) {
       case "notifications/initialized":
         return
       case "tools/list":
-        return reply(id, { tools: TOOLS })
+        return ok({ tools: TOOLS })
       case "tools/call": {
         const name = msg.params?.name
         const args = msg.params?.arguments ?? {}
         switch (name) {
           case "decide": {
-            const err = needState(args)
-            if (err) return fail(id, -32602, err)
+            const errMsg = needState(args)
+            if (errMsg) return err(-32602, errMsg)
             const text = await decideWithContext(args.state, args.context, args.questions)
-            return reply(id, { content: [{ type: "text", text }] })
+            return ok({ content: [{ type: "text", text }] })
           }
           case "route_expert": {
-            const err = needState(args)
-            if (err) return fail(id, -32602, err)
+            const errMsg = needState(args)
+            if (errMsg) return err(-32602, errMsg)
             const text = await routeExpert(args.state, args.context)
-            return reply(id, { content: [{ type: "text", text }] })
+            return ok({ content: [{ type: "text", text }] })
           }
           case "assess_risk": {
-            const err = needState(args)
-            if (err) return fail(id, -32602, err)
+            const errMsg = needState(args)
+            if (errMsg) return err(-32602, errMsg)
             const text = await assessRisk(args.state, args.context)
-            return reply(id, { content: [{ type: "text", text }] })
+            return ok({ content: [{ type: "text", text }] })
           }
           case "discover":
-            return reply(id, {
+            return ok({
               content: [{ type: "text", text: JSON.stringify(discoverPayload()) }],
             })
           default:
-            return fail(id, -32602, `unknown tool: ${name}`)
+            return err(-32602, `unknown tool: ${name}`)
         }
       }
       case "ping":
-        return reply(id, {})
+        return ok({})
       default:
-        return fail(id, -32601, `unknown method: ${msg.method}`)
+        if (typeof msg.method !== "string") {
+          try {
+            log("rpc.invalid", { reason: "missing-method" })
+          } catch {
+            // never throw from logging
+          }
+          return err(-32600, "invalid request: method must be a string")
+        }
+        return err(-32601, `unknown method: ${msg.method}`)
     }
   } catch (e) {
-    fail(id, -32603, e instanceof Error ? e.message : String(e))
+    try {
+      log("handle.crash", {
+        where: "handle",
+        error: e instanceof Error ? e.message : String(e).slice(0, 200),
+      })
+    } catch {
+      // never throw from a backstop
+    }
+    try {
+      if (!isNotification) fail(fallbackId, -32603, e instanceof Error ? e.message : String(e))
+    } catch {
+      // reply path must never throw
+    }
   }
 }
 
+// Bound the stdin line buffer: without a cap a client that never sends "\n"
+// grows `buf` forever. On overflow emit -32700 (parse error) and reset.
+const MAX_BUF_CHARS = 1_048_576 // 1 MiB
 let buf = ""
 process.stdin.setEncoding("utf8")
 process.stdin.on("data", (chunk: string) => {
@@ -135,10 +284,47 @@ process.stdin.on("data", (chunk: string) => {
     const line = buf.slice(0, i).trim()
     buf = buf.slice(i + 1)
     if (!line) continue
+    let parsed: unknown
     try {
-      void handle(JSON.parse(line) as RpcMsg)
+      parsed = JSON.parse(line)
     } catch (e) {
+      try {
+        log("rpc.invalid", { reason: "parse-error" })
+      } catch {
+        // never throw from logging
+      }
       fail(null, -32700, e instanceof Error ? e.message : String(e))
+      continue
+    }
+    // (B4) handle() is async: attach .catch() so a rejection never goes
+    // unhandled (Node >= 15 turns those into fatal uncaught exceptions).
+    void handle(parsed).catch((e) => {
+      try {
+        log("handle.crash", {
+          where: "handle-rejection",
+          error: e instanceof Error ? e.message : String(e).slice(0, 200),
+        })
+      } catch {
+        // never throw from a backstop
+      }
+      try {
+        fail(null, -32603, e instanceof Error ? e.message : String(e))
+      } catch {
+        // reply path must never throw
+      }
+    })
+  }
+  if (buf.length > MAX_BUF_CHARS) {
+    try {
+      log("rpc.invalid", { reason: "stdin-overflow", buf_chars: buf.length })
+    } catch {
+      // never throw from logging
+    }
+    buf = ""
+    try {
+      fail(null, -32700, "stdin buffer overflow: line exceeded 1 MiB, buffer reset")
+    } catch {
+      // reply path must never throw
     }
   }
 })
