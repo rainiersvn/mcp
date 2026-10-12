@@ -37,6 +37,7 @@ import {
   _clearJevCache,
   _jevCacheSize,
   assessRisk,
+  authHeaders,
   backoffDelayMs,
   bucketFor,
   cacheKeyFor,
@@ -45,7 +46,9 @@ import {
   defaultQuestions,
   discoverPayload,
   extractScore,
+  isBearerOptIn,
   log,
+  resolveBearer,
   riskQuestions,
   routeExpert,
   serializeState,
@@ -268,8 +271,12 @@ describe("fallback:true contract (offline failure paths only — no network)", (
     await writeFile(join(tmp, ".local", "share", "opencode", "auth.json"), secret, "utf8");
     const prevHome = process.env.HOME;
     const prevProfile = process.env.USERPROFILE;
+    const prevBearer = process.env.JEV_BEARER;
     process.env.HOME = tmp;
     process.env.USERPROFILE = tmp;
+    // Opted-in path: the key IS read here, so a corrupt file must fall back
+    // safely. (Default no-auth path never reads the file at all.)
+    process.env.JEV_BEARER = "1";
     try {
       const text = await decide("hello linger");
       assert.ok(text.startsWith(FALLBACK_PREFIX), text.slice(0, 80));
@@ -280,6 +287,8 @@ describe("fallback:true contract (offline failure paths only — no network)", (
       else process.env.HOME = prevHome;
       if (prevProfile === undefined) delete process.env.USERPROFILE;
       else process.env.USERPROFILE = prevProfile;
+      if (prevBearer === undefined) delete process.env.JEV_BEARER;
+      else process.env.JEV_BEARER = prevBearer;
       await rm(tmp, { recursive: true, force: true });
     }
   });
@@ -389,6 +398,7 @@ describe("discoverPayload key contract", () => {
   test("top-level KEY names are unchanged (callers depend on them)", () => {
     const payload = discoverPayload() as Record<string, unknown>;
     assert.deepEqual(Object.keys(payload).sort(), [
+      "auth_mode",
       "code_mode_note",
       "context_note",
       "endpoint",
@@ -903,8 +913,11 @@ describe("bounded retry + cached bearer (offline — injected fetch/time)", () =
     await writeFile(join(tmp, ".local", "share", "opencode", "auth.json"), JSON.stringify({ opencode: { key: "key-A" } }), "utf8");
     const prevHome = process.env.HOME;
     const prevProfile = process.env.USERPROFILE;
+    const prevBearer = process.env.JEV_BEARER;
     process.env.HOME = tmp;
     process.env.USERPROFILE = tmp;
+    // Bearer is opt-in: this rotation path only runs when opted in.
+    process.env.JEV_BEARER = "1";
     try {
       t = 12_000_000;
       let calls = 0;
@@ -930,7 +943,37 @@ describe("bounded retry + cached bearer (offline — injected fetch/time)", () =
       else process.env.HOME = prevHome;
       if (prevProfile === undefined) delete process.env.USERPROFILE;
       else process.env.USERPROFILE = prevProfile;
+      if (prevBearer === undefined) delete process.env.JEV_BEARER;
+      else process.env.JEV_BEARER = prevBearer;
       await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("a 401 with NO bearer configured does NOT touch the filesystem", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    const prevBearer = process.env.JEV_BEARER;
+    delete process.env.JEV_BEARER;
+    try {
+      t = 12_500_000;
+      let calls = 0;
+      const deps = {
+        fetchImpl: async () => {
+          calls++;
+          return new Response("nope", { status: 401 });
+        },
+        now,
+        sleep: async (_ms: number) => {},
+        rng: zeroRng,
+      };
+      const r = await decide("retry-401-no-bearer-state", undefined, deps);
+      assert.equal(calls, 1, "401 must never retry the fetch");
+      assert.equal(_bearerStats.fileReads, 0, "no-auth path must never read auth.json");
+      assert.equal(_bearerStats.rereads, 0, "no-auth path must not attempt a rotation re-read");
+      assert.ok(r.startsWith(FALLBACK_PREFIX));
+    } finally {
+      if (prevBearer === undefined) delete process.env.JEV_BEARER;
+      else process.env.JEV_BEARER = prevBearer;
     }
   });
 
@@ -1129,5 +1172,227 @@ describe("response envelope (offline — injected fetch)", () => {
     for (const k of ["model", "endpoint", "timeout_ms", "question_types", "score_semantics", "recommended_usage"]) {
       assert.ok(k in payload, `existing key ${k} must survive`);
     }
+  });
+
+  test("discover documents the opt-in bearer in auth_mode", () => {
+    const payload = discoverPayload() as Record<string, unknown>;
+    assert.ok("auth_mode" in payload, "auth_mode key must exist");
+    const text = String(payload.auth_mode);
+    assert.ok(/JEV_BEARER/i.test(text), `auth_mode must name JEV_BEARER: ${text.slice(0, 120)}`);
+    assert.ok(/no authorization|no auth/i.test(text), `auth_mode must state the no-auth default: ${text.slice(0, 120)}`);
+  });
+});
+
+describe("opt-in bearer (free-tier default = no Authorization header)", () => {
+  let t: number;
+  const now = () => t;
+  const okJson = (v: unknown) =>
+    new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } });
+  const withEnv = (value: string | undefined, fn: () => Promise<void>) => {
+    const prev = process.env.JEV_BEARER;
+    return (async () => {
+      try {
+        if (value === undefined) delete process.env.JEV_BEARER;
+        else process.env.JEV_BEARER = value;
+        await fn();
+      } finally {
+        if (prev === undefined) delete process.env.JEV_BEARER;
+        else process.env.JEV_BEARER = prev;
+      }
+    })();
+  };
+
+  test("authHeaders(null) and authHeaders('') carry NO authorization key", () => {
+    for (const tok of [null, ""]) {
+      const h = authHeaders(tok as string | null);
+      assert.equal(h["content-type"], "application/json");
+      assert.ok(!("authorization" in h), `token ${JSON.stringify(tok)} must not produce authorization`);
+    }
+  });
+
+  test("authHeaders('sk-x') carries 'authorization: Bearer sk-x'", () => {
+    assert.deepEqual(authHeaders("sk-x"), {
+      "content-type": "application/json",
+      authorization: "Bearer sk-x",
+    });
+  });
+
+  test("isBearerOptIn truth table (case-insensitive, whitespace-tolerant)", () => {
+    const prev = process.env.JEV_BEARER;
+    try {
+      for (const on of ["1", "true", "TRUE", " True ", "yes", "YES", "on", "ON", " On "]) {
+        process.env.JEV_BEARER = on;
+        assert.equal(isBearerOptIn(), true, `JEV_BEARER=${JSON.stringify(on)} must opt in`);
+      }
+      delete process.env.JEV_BEARER;
+      assert.equal(isBearerOptIn(), false, "unset must be off");
+      for (const off of ["0", "false", "no", "off", "garbage", "", "  "]) {
+        process.env.JEV_BEARER = off;
+        assert.equal(isBearerOptIn(), false, `JEV_BEARER=${JSON.stringify(off)} must be off`);
+      }
+    } finally {
+      if (prev === undefined) delete process.env.JEV_BEARER;
+      else process.env.JEV_BEARER = prev;
+    }
+  });
+
+  test("JEV_BEARER unset: no authorization header AND the token resolver is never called", async () => {
+    await withEnv(undefined, async () => {
+      _clearJevCache();
+      _clearBearerCache();
+      t = 30_000_000;
+      let resolverCalls = 0;
+      let sentHeaders: Record<string, unknown> | undefined;
+      const deps = {
+        fetchImpl: async (_url: string, init?: RequestInit) => {
+          sentHeaders = { ...(init?.headers as Record<string, unknown>) };
+          return okJson({ expert: "coder" });
+        },
+        readToken: async (): Promise<string> => {
+          resolverCalls++;
+          throw new Error("token resolver must not be called on the no-auth path");
+        },
+        now,
+        sleep: async (_ms: number) => {},
+        rng: () => 0,
+      };
+      const r = await decide("optin-unset-state", undefined, deps);
+      assert.equal(resolverCalls, 0, "resolver must never be called when not opted in");
+      assert.equal(_bearerStats.fileReads, 0, "auth.json must never be read when not opted in");
+      assert.ok(sentHeaders && !("authorization" in sentHeaders), `headers must lack authorization: ${JSON.stringify(sentHeaders)}`);
+      assert.ok(!r.startsWith(FALLBACK_PREFIX), `must succeed, got: ${r.slice(0, 80)}`);
+    });
+  });
+
+  test("JEV_BEARER=1: authorization IS present (injected resolver)", async () => {
+    await withEnv("1", async () => {
+      _clearJevCache();
+      _clearBearerCache();
+      t = 31_000_000;
+      let sentHeaders: Record<string, unknown> | undefined;
+      const deps = {
+        fetchImpl: async (_url: string, init?: RequestInit) => {
+          sentHeaders = { ...(init?.headers as Record<string, unknown>) };
+          return okJson({ expert: "coder" });
+        },
+        readToken: async () => "sk-test-123",
+        now,
+        sleep: async (_ms: number) => {},
+        rng: () => 0,
+      };
+      const r = await decide("optin-on-state", undefined, deps);
+      assert.equal(sentHeaders?.authorization, "Bearer sk-test-123");
+      assert.ok(!r.startsWith(FALLBACK_PREFIX));
+    });
+  });
+
+  test("JEV_BEARER=1: authorization IS present (real auth.json file)", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "jev-optin-"));
+    await mkdir(join(tmp, ".local", "share", "opencode"), { recursive: true });
+    await writeFile(join(tmp, ".local", "share", "opencode", "auth.json"), JSON.stringify({ opencode: { key: "file-key-ABC" } }), "utf8");
+    const prevHome = process.env.HOME;
+    const prevProfile = process.env.USERPROFILE;
+    process.env.HOME = tmp;
+    process.env.USERPROFILE = tmp;
+    await withEnv("1", async () => {
+      _clearJevCache();
+      _clearBearerCache();
+      t = 32_000_000;
+      let sentHeaders: Record<string, unknown> | undefined;
+      const r = await decide("optin-file-state", undefined, {
+        fetchImpl: async (_url: string, init?: RequestInit) => {
+          sentHeaders = { ...(init?.headers as Record<string, unknown>) };
+          return okJson({ expert: "planner" });
+        },
+        now,
+        sleep: async (_ms: number) => {},
+        rng: () => 0,
+      });
+      assert.equal(sentHeaders?.authorization, "Bearer file-key-ABC");
+      assert.ok(!r.startsWith(FALLBACK_PREFIX));
+    });
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
+    await rm(tmp, { recursive: true, force: true });
+  });
+
+  test("JEV_BEARER=0 and garbage are treated as off (no header, no file read)", async () => {
+    for (const val of ["0", "garbage"]) {
+      await withEnv(val, async () => {
+        _clearJevCache();
+        _clearBearerCache();
+        t = 33_000_000;
+        let sentHeaders: Record<string, unknown> | undefined;
+        const r = await decide(`optin-off-${val}-state`, undefined, {
+          fetchImpl: async (_url: string, init?: RequestInit) => {
+            sentHeaders = { ...(init?.headers as Record<string, unknown>) };
+            return okJson({ expert: "coder" });
+          },
+          readToken: async (): Promise<string> => {
+            throw new Error("must not be called when off");
+          },
+          now,
+          sleep: async (_ms: number) => {},
+          rng: () => 0,
+        });
+        assert.ok(sentHeaders && !("authorization" in sentHeaders), `JEV_BEARER=${val}: ${JSON.stringify(sentHeaders)}`);
+        assert.equal(_bearerStats.fileReads, 0);
+        assert.ok(!r.startsWith(FALLBACK_PREFIX));
+      });
+    }
+  });
+
+  test("resolveBearer() reads env at call time (flips between calls, no stale cache)", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "jev-resolve-"));
+    await mkdir(join(tmp, ".local", "share", "opencode"), { recursive: true });
+    await writeFile(join(tmp, ".local", "share", "opencode", "auth.json"), JSON.stringify({ opencode: { key: "flip-key" } }), "utf8");
+    const prevHome = process.env.HOME;
+    const prevProfile = process.env.USERPROFILE;
+    const prevBearer = process.env.JEV_BEARER;
+    process.env.HOME = tmp;
+    process.env.USERPROFILE = tmp;
+    try {
+      delete process.env.JEV_BEARER;
+      assert.equal(await resolveBearer(), null, "off -> null without touching the file");
+      process.env.JEV_BEARER = "1";
+      assert.equal(await resolveBearer(), "flip-key", "on -> key from auth.json");
+      process.env.JEV_BEARER = "0";
+      assert.equal(await resolveBearer(), null, "flipped back off -> null again (call-time read)");
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = prevProfile;
+      if (prevBearer === undefined) delete process.env.JEV_BEARER;
+      else process.env.JEV_BEARER = prevBearer;
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("REGRESSION: a 200 with NO auth header yields a normal envelope (not fallback:true)", async () => {
+    await withEnv(undefined, async () => {
+      _clearJevCache();
+      _clearBearerCache();
+      t = 34_000_000;
+      let sentHeaders: Record<string, unknown> | undefined;
+      const r = await decide("Add retry logic to the billing worker", undefined, {
+        fetchImpl: async (_url: string, init?: RequestInit) => {
+          sentHeaders = { ...(init?.headers as Record<string, unknown>) };
+          // The exact shape the free tier returns with no Authorization header.
+          return okJson({ model: "jev-1.13-free", answers: { expert: "coder" } });
+        },
+        now,
+        sleep: async (_ms: number) => {},
+        rng: () => 0,
+      });
+      assert.ok(sentHeaders && !("authorization" in sentHeaders), `must send no auth: ${JSON.stringify(sentHeaders)}`);
+      assert.ok(!r.startsWith("fallback:true"), `the broken scenario must not fall back: ${r.slice(0, 120)}`);
+      const p = JSON.parse(r) as any;
+      assert.ok(p._jev, "envelope must carry _jev");
+      assert.equal(p._jev.cached, "none");
+      assert.equal(p.model, "jev-1.13-free");
+    });
   });
 });
