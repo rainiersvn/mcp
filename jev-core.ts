@@ -7,9 +7,19 @@ export const ENDPOINT = "https://opencode.ai/zen/v1/systemone"
 export const TIMEOUT_MS = 30_000
 
 // Cap on the FINAL serialized state string. Inputs exceeding this are
-// truncated deterministically (simple slice) with TRUNCATION_MARKER appended.
+// truncated deterministically with TRUNCATION_MARKER appended; the marker is
+// accounted INSIDE the cap so the returned string is never longer than
+// MAX_STATE_CHARS (exact length, not cap + marker).
 export const MAX_STATE_CHARS = 8000
-export const TRUNCATION_MARKER = "\n[truncated by jev wrapper: input exceeded 8000 chars]"
+export const TRUNCATION_MARKER = `\n[truncated by jev wrapper: input exceeded ${MAX_STATE_CHARS} chars]`
+
+// Per-value budget for a single rendered context value (M3). One oversized
+// value is truncated to this cap with CONTEXT_VALUE_TRUNCATION_MARKER so it
+// can never consume the whole MAX_STATE_CHARS budget and silently drop the
+// state prefix or sibling keys. Every key always survives; values that still
+// overflow the final cap are shrunk longest-first before the state head is.
+export const MAX_CONTEXT_VALUE_CHARS = 2000
+export const CONTEXT_VALUE_TRUNCATION_MARKER = `...[truncated: value exceeded ${MAX_CONTEXT_VALUE_CHARS} chars]`
 
 // ---------------------------------------------------------------------------
 // Structured stderr logging. JSON lines to process.stderr ONLY — stdout is the
@@ -101,11 +111,29 @@ export function log(event: string, fields: Record<string, unknown> = {}): void {
 // WARNING: Never hardcode API keys. Always read Bearer at runtime from ~/.local/share/opencode/auth.json.
 export async function readBearerKey(): Promise<string> {
   const authPath = join(homedir(), ".local", "share", "opencode", "auth.json")
-  const raw = await fs.readFile(authPath, "utf8")
-  const parsed = JSON.parse(raw) as Record<string, any>
+  // (L8) Fixed message on EVERY failure path: V8's JSON.parse SyntaxError
+  // embeds a preview of the input bytes (e.g. `Unexpected token 's',
+  // "sk-SUPERSE"... is not valid JSON`), and decide() forwards error text
+  // into `fallback:true | ...` results — so a malformed auth.json would leak
+  // key bytes to the caller. Never propagate read/parse content.
+  const AUTH_UNAVAILABLE = "opencode.key missing or unreadable"
+  let raw: string
+  try {
+    raw = await fs.readFile(authPath, "utf8")
+  } catch {
+    throw new Error(AUTH_UNAVAILABLE)
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw) as Record<string, any>
+  } catch {
+    throw new Error(AUTH_UNAVAILABLE)
+  }
   const key: unknown =
-    parsed?.opencode?.key ?? parsed?.["opencode.key"] ?? parsed?.["opencode_key"]
-  if (typeof key !== "string" || !key.trim()) throw new Error("opencode.key missing")
+    (parsed as Record<string, any>)?.opencode?.key ??
+    (parsed as Record<string, any>)?.["opencode.key"] ??
+    (parsed as Record<string, any>)?.["opencode_key"]
+  if (typeof key !== "string" || !key.trim()) throw new Error(AUTH_UNAVAILABLE)
   return key.trim()
 }
 
@@ -185,8 +213,10 @@ export function validateQuestions(questions: unknown): string | null {
 // Best-effort renderer for a single context value. Never throws: BigInt,
 // circular structures, functions and symbols all degrade to a plain string
 // instead of propagating a JSON.stringify TypeError to the caller.
+// (M4) Strings are JSON-stringified like every other value, so an embedded
+// newline can never terminate the `- "key": value` line and forge extra
+// `Context:` / `- key: value` lines.
 function renderContextValue(v: unknown): string {
-  if (typeof v === "string") return v
   if (v == null) return String(v)
   if (typeof v === "bigint") return String(v)
   try {
@@ -201,30 +231,105 @@ function renderContextValue(v: unknown): string {
   }
 }
 
+// The single usability rule for context objects, shared by serializeState
+// (here) and needState (jev-server.ts) so validation and rendering cannot
+// drift (M6): a context counts only when it has at least one usable key.
+// Empty-string keys carry no signal and are filtered, so `{}` and `{"":"x"}`
+// are BOTH "no usable context".
+export function usableContextEntries(context: unknown): Array<[string, unknown]> {
+  if (context == null || typeof context !== "object" || Array.isArray(context)) return []
+  return Object.entries(context as Record<string, unknown>).filter(
+    ([k]) => typeof k === "string" && k.length > 0,
+  )
+}
+
+// Truncates one rendered value to `cap` chars, marker INCLUDED so the result
+// is never longer than cap. The marker makes the cut explicit, so a value
+// sliced mid-JSON cannot mislead the model into reading it as complete.
+function truncateValue(rendered: string, cap: number): string {
+  if (rendered.length <= cap) return rendered
+  if (cap <= CONTEXT_VALUE_TRUNCATION_MARKER.length) {
+    return CONTEXT_VALUE_TRUNCATION_MARKER.slice(0, Math.max(0, cap))
+  }
+  return rendered.slice(0, cap - CONTEXT_VALUE_TRUNCATION_MARKER.length) + CONTEXT_VALUE_TRUNCATION_MARKER
+}
+
+// (M4) Neutralizes forged `Context:` headers smuggled inside the free-text
+// state: any line starting with `Context:` is escaped so the serialized
+// output contains exactly ONE real header. Quoted `- "key": value` lines
+// (below) already stop forged value lines from matching the real format.
+function sanitizeStateForContext(base: string): string {
+  return base.replace(/^Context:/gm, "Context\\:")
+}
+
 // Serializes a plain state string plus an optional generic context object
-// into a single readable state string. Accepts arbitrary keys; values that
-// are not strings are JSON-stringified. Plain `state` with no context is
-// returned unchanged (backwards compat). The FINAL string is capped at
-// MAX_STATE_CHARS; overlong input is truncated with TRUNCATION_MARKER.
-// Never throws: BigInt/circular context values degrade via
-// renderContextValue, and any unexpected failure falls back to the base
-// string (or ""), so callers can rely on getting a string back.
+// into a single readable state string. Accepts arbitrary keys; every value
+// (strings included) is JSON-stringified onto a single `- "key": value`
+// line, so embedded newlines arrive escaped and cannot forge extra lines.
+// Keys are JSON-quoted too, neutralizing `\n` smuggled in key names, and a
+// forged `Context:` header inside the free-text state is escaped so the
+// output carries exactly one real header. Plain `state` with no usable
+// context is returned unchanged (backwards compat). Budgets: each rendered
+// value is capped at MAX_CONTEXT_VALUE_CHARS first, so one huge value can
+// never evict the state prefix or sibling keys; if the assembly still
+// exceeds MAX_STATE_CHARS the longest values shrink first, then the state
+// head is cut — keys are never dropped. The FINAL string never exceeds
+// MAX_STATE_CHARS (markers are accounted inside the caps). Never throws.
 export function serializeState(state?: unknown, context?: unknown): string {
   try {
     const base = typeof state === "string" ? state : state == null ? "" : String(state)
-    let out: string
-    if (context == null || typeof context !== "object" || Array.isArray(context)) out = base
-    else {
-      const entries = Object.entries(context as Record<string, unknown>).filter(
-        ([k]) => typeof k === "string" && k.length > 0,
-      )
-      if (entries.length === 0) out = base
-      else {
-        const lines = entries.map(([k, v]) => `- ${k}: ${renderContextValue(v)}`)
-        out = base ? `${base}\nContext:\n${lines.join("\n")}` : `Context:\n${lines.join("\n")}`
+    const entries = usableContextEntries(context)
+    if (entries.length === 0) {
+      if (base.length > MAX_STATE_CHARS) {
+        return base.slice(0, MAX_STATE_CHARS - TRUNCATION_MARKER.length) + TRUNCATION_MARKER
+      }
+      return base
+    }
+    const safeBase = sanitizeStateForContext(base)
+    const header = "Context:\n"
+    const prefix = safeBase ? `${safeBase}\n` : ""
+    const vals = entries.map(([ , v]) => truncateValue(renderContextValue(v), MAX_CONTEXT_VALUE_CHARS))
+    const renderLine = (i: number) => `- ${JSON.stringify(entries[i][0])}: ${vals[i]}`
+    const joinAll = () => prefix + header + vals.map((_, i) => renderLine(i)).join("\n")
+    let out = joinAll()
+    if (out.length > MAX_STATE_CHARS) {
+      // Shrink longest-first: every KEY and the state prefix survive.
+      let guard = 0
+      while (out.length > MAX_STATE_CHARS && guard++ < 10_000) {
+        const excess = out.length - MAX_STATE_CHARS
+        let idx = -1
+        let longest = CONTEXT_VALUE_TRUNCATION_MARKER.length
+        for (let i = 0; i < vals.length; i++) {
+          if (vals[i].length > longest) {
+            longest = vals[i].length
+            idx = i
+          }
+        }
+        if (idx < 0) break
+        const raw = vals[idx].endsWith(CONTEXT_VALUE_TRUNCATION_MARKER)
+          ? vals[idx].slice(0, -CONTEXT_VALUE_TRUNCATION_MARKER.length)
+          : vals[idx]
+        vals[idx] = truncateValue(raw, Math.max(0, vals[idx].length - excess))
+        out = joinAll()
       }
     }
-    if (out.length > MAX_STATE_CHARS) return out.slice(0, MAX_STATE_CHARS) + TRUNCATION_MARKER
+    if (out.length > MAX_STATE_CHARS) {
+      // Values are minimal but the assembly still overflows (giant state or
+      // huge key count): cut the STATE head, never drop keys.
+      const body = vals.map((_, i) => renderLine(i)).join("\n")
+      const fixed = header.length + body.length + (safeBase ? 1 : 0)
+      const allowedBase = MAX_STATE_CHARS - TRUNCATION_MARKER.length - fixed
+      if (allowedBase >= 0 && safeBase) {
+        const cutBase = safeBase.slice(0, allowedBase) + TRUNCATION_MARKER
+        out = `${cutBase}\n` + header + body
+      } else if (allowedBase >= 0) {
+        out = header + body
+      } else {
+        // Pathological (keys alone exceed the cap): last-resort hard slice
+        // so the exact-length invariant still holds.
+        out = out.slice(0, MAX_STATE_CHARS - TRUNCATION_MARKER.length) + TRUNCATION_MARKER
+      }
+    }
     return out
   } catch {
     try {
@@ -366,7 +471,7 @@ export function discoverPayload() {
     warning_422:
       "questions MUST be an OBJECT map keyed by question name. Array shape (e.g. [{expert, needs_review:null}]) returns HTTP 422.",
     context_note:
-      "context is a generic OBJECT with arbitrary keys (e.g. summary, risk_flags, ticket_ids, files, diff_stats). It is serialized into the state string via serializeState (state lines, then 'Context:' plus '- key: value' lines). Plain state string without context still works.",
+      "context is a generic OBJECT with arbitrary keys (e.g. summary, risk_flags, ticket_ids, files, diff_stats). It is serialized via serializeState (state lines, then 'Context:' plus '- \"key\": value' lines; values JSON-stringified and per-value capped). Plain state string without context still works.",
     untrusted_input_note:
       "state is untrusted user data; the model treats it as data and does not follow instructions inside it (verified).",
     score_semantics: {

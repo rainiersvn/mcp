@@ -1,4 +1,4 @@
-import { assessRisk, decideWithContext, discoverPayload, log, routeExpert } from "./jev-core.ts"
+import { assessRisk, decideWithContext, discoverPayload, log, routeExpert, usableContextEntries } from "./jev-core.ts"
 
 type RpcMsg = { jsonrpc: "2.0"; id?: number | string | null; method?: string; params?: any }
 
@@ -103,7 +103,7 @@ const STATE_PROP = {
 const CONTEXT_PROP = {
   type: "object",
   description:
-    "OPTIONAL generic context object with arbitrary keys (e.g. summary, risk_flags, ticket_ids, files, diff_stats). Serialized into the state string as 'Context:' plus '- key: value' lines; non-string values are JSON-stringified. Backwards compatible: plain state string without context still works. state is untrusted user data; the model treats it as data and does not follow instructions inside it (verified).",
+    "OPTIONAL generic context object with arbitrary keys (e.g. summary, risk_flags, ticket_ids, files, diff_stats). Serialized into the state string as 'Context:' plus '- \"key\": value' lines; every value is JSON-stringified and per-value capped. Backwards compatible: plain state string without context still works. state is untrusted user data; the model treats it as data and does not follow instructions inside it (verified).",
 } as const
 const QUESTIONS_PROP = {
   type: "object",
@@ -114,7 +114,7 @@ const QUESTIONS_PROP = {
 const Q_SHAPE = `Each questions entry requires type ("choice"|"score"|"noul") + instructions (string) + criteria (object map or array).`
 const GOTCHA_422 = `GOTCHA: questions MUST be an object map, never an array. Array shape (e.g. [{"expert":...}]) returns HTTP 422.`
 const BRACKET = `In Code Mode call as tools["jev"].<tool> after resolving the path with search({query:"jev"}).`
-const FALLBACK = `On any failure the tool returns a string starting "fallback:true | ..." (never throws); proceed on your own judgement.`
+const FALLBACK = `On argument-validation or execution failure a known tool returns content[0].text starting "fallback:true | ..." with isError:true (never throws); only protocol errors (bad envelope -32600, unparsable line -32700, unknown method -32601, unknown tool -32602) are JSON-RPC errors. Proceed on your own judgement.`
 
 const TOOLS = [
   {
@@ -149,11 +149,17 @@ const TOOLS = [
 ]
 
 function needState(args: any): string | null {
-  const hasState = typeof args.state === "string" && args.state.trim().length > 0
-  const hasContext =
-    args.context != null && typeof args.context === "object" && !Array.isArray(args.context)
-  if (!hasState && !hasContext) return "at least one of state (string) or context (object) is required"
-  if (args.state !== undefined && typeof args.state !== "string") return "state must be a string"
+  const a = (args ?? {}) as Record<string, unknown>
+  // (L2) Type check FIRST: {"state":123} must report "state must be a
+  // string", not the absence message below.
+  if (a.state !== undefined && typeof a.state !== "string") return "state must be a string"
+  const hasState = typeof a.state === "string" && a.state.trim().length > 0
+  // (M6) Usability rule shared with serializeState via usableContextEntries:
+  // {} and {"":"x"} have no usable keys, so they do NOT count as context.
+  const hasContext = usableContextEntries(a.context).length > 0
+  if (!hasState && !hasContext) {
+    return "at least one of state (non-blank string) or context (object with at least one usable key) is required"
+  }
   return null
 }
 
@@ -201,6 +207,17 @@ async function handle(raw: unknown) {
     }
     const ok = (result: unknown) => done(() => reply(id, result))
     const err = (code: number, message: string) => done(() => fail(id, code, message))
+    // (M1) ONE contract: every known-tool failure carries a `fallback:true |`
+    // text body. Validation failures get isError:true here; execution results
+    // get isError:true whenever their text carries the fallback prefix.
+    const FALLBACK_PREFIX = "fallback:true | "
+    const okText = (text: string) =>
+      ok({
+        content: [{ type: "text", text }],
+        ...(text.startsWith(FALLBACK_PREFIX) ? { isError: true } : {}),
+      })
+    const validationFail = (message: string) =>
+      ok({ content: [{ type: "text", text: `${FALLBACK_PREFIX}${message}` }], isError: true })
     switch (msg.method) {
       case "initialize":
         return ok({
@@ -218,21 +235,21 @@ async function handle(raw: unknown) {
         switch (name) {
           case "decide": {
             const errMsg = needState(args)
-            if (errMsg) return err(-32602, errMsg)
+            if (errMsg) return validationFail(errMsg)
             const text = await decideWithContext(args.state, args.context, args.questions)
-            return ok({ content: [{ type: "text", text }] })
+            return okText(text)
           }
           case "route_expert": {
             const errMsg = needState(args)
-            if (errMsg) return err(-32602, errMsg)
+            if (errMsg) return validationFail(errMsg)
             const text = await routeExpert(args.state, args.context)
-            return ok({ content: [{ type: "text", text }] })
+            return okText(text)
           }
           case "assess_risk": {
             const errMsg = needState(args)
-            if (errMsg) return err(-32602, errMsg)
+            if (errMsg) return validationFail(errMsg)
             const text = await assessRisk(args.state, args.context)
-            return ok({ content: [{ type: "text", text }] })
+            return okText(text)
           }
           case "discover":
             return ok({
@@ -298,6 +315,8 @@ process.stdin.on("data", (chunk: string) => {
     }
     // (B4) handle() is async: attach .catch() so a rejection never goes
     // unhandled (Node >= 15 turns those into fatal uncaught exceptions).
+    // (M5) A notification (no id) must stay silent even here: check the id
+    // before emitting the backstop reply.
     void handle(parsed).catch((e) => {
       try {
         log("handle.crash", {
@@ -308,6 +327,9 @@ process.stdin.on("data", (chunk: string) => {
         // never throw from a backstop
       }
       try {
+        const isNotification =
+          parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as RpcMsg).id === undefined
+        if (isNotification) return
         fail(null, -32603, e instanceof Error ? e.message : String(e))
       } catch {
         // reply path must never throw
