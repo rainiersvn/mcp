@@ -1,4 +1,4 @@
-import { assessRisk, decideWithContext, discoverPayload, log, routeExpert, usableContextEntries } from "./jev-core.ts"
+import { assessRisk, decideBatch, decideWithContext, discoverPayload, log, routeExpert, usableContextEntries } from "./jev-core.ts"
 
 type RpcMsg = { jsonrpc: "2.0"; id?: number | string | null; method?: string; params?: any }
 
@@ -158,6 +158,29 @@ export const TOOLS = [
     description: `Discovery entry point: call first if unsure how to use this suite. Types, fields, 422 warning, context rules, examples. ${BRACKET}`,
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
+  {
+    name: "batch",
+    description: `Batch routing: several judgements about one task in a single round trip under different framings, not one decision. Pool of 4, max 8 requests; a bad entry fails per-entry only. See discover.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        requests: {
+          type: "array",
+          description: "Non-empty batch of {state, context?, questions?} entries, max 8.",
+          minItems: 1,
+          maxItems: 8,
+          items: {
+            type: "object",
+            properties: { state: STATE_PROP, context: CONTEXT_PROP, questions: QUESTIONS_PROP },
+            anyOf: [{ required: ["state"] }, { required: ["context"] }],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["requests"],
+      additionalProperties: false,
+    },
+  },
 ]
 
 function needState(args: any): string | null {
@@ -270,6 +293,13 @@ async function handle(raw: unknown) {
             return ok({
               content: [{ type: "text", text: JSON.stringify(discoverPayload()) }],
             })
+          case "batch": {
+            // decideBatch never throws and never fails the batch on a bad
+            // entry: batch-level shape errors AND per-entry failures both come
+            // back inside the fallback:true / JSON contract via okText.
+            const text = await decideBatch(args.requests)
+            return okText(text)
+          }
           default:
             return err(-32602, `unknown tool: ${name}`)
         }

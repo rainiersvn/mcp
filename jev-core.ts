@@ -982,6 +982,123 @@ export async function assessRisk(state?: unknown, context?: unknown, deps?: Deci
   return decideWithContext(state, context, riskQuestions(), deps)
 }
 
+// ---------------------------------------------------------------------------
+// BOUNDED-CONCURRENCY BATCH
+//
+// One round trip, N judgements: the routing orchestrator usually wants SEVERAL
+// framings of the same task at once (e.g. "which expert?" + "how much
+// review?"), and N separate tool calls cost N x ~1-3.5s. decideBatch runs N
+// requests through the SAME decideWithContext pipeline per entry — validation,
+// cache lookup, TTL rules, retry, envelope, coalescing — so there is no
+// parallel code path that can drift from decide. The pool is bounded (default
+// BATCH_DEFAULT_CONCURRENCY, override via BatchDeps.concurrency) so a batch
+// never hammers the endpoint with N simultaneous calls. Order is preserved
+// (results[i] answers requests[i]). ONE bad entry never fails the batch: it
+// yields its own `fallback:true | ...` string in place while the rest of the
+// batch still returns real envelopes. Never throws: batch-level shape errors
+// (non-array, empty, over BATCH_MAX_SIZE) return a `fallback:true | ...`
+// string, and a throwing entry degrades to one too.
+// Response: compact JSON {results: string[], summary: {total, ok, fallback,
+// cached}} — each result is the exact string decide() would have returned.
+// ---------------------------------------------------------------------------
+export const BATCH_MAX_SIZE = 8
+export const BATCH_DEFAULT_CONCURRENCY = 4
+
+export interface BatchRequest {
+  state?: unknown
+  context?: unknown
+  questions?: unknown
+}
+
+// DecideDeps plus the pool override. concurrency is clamped to a finite
+// integer >= 1; garbage falls back to BATCH_DEFAULT_CONCURRENCY.
+export interface BatchDeps extends DecideDeps {
+  concurrency?: number
+}
+
+const BATCH_SHAPE_ERROR =
+  "fallback:true | batch requests must be a non-empty array of {state, context?, questions?} objects"
+
+export async function decideBatch(requests: unknown, deps?: BatchDeps): Promise<string> {
+  try {
+    if (!Array.isArray(requests) || requests.length === 0) {
+      log("decide.batch.fallback", { reason: !Array.isArray(requests) ? "non-array" : "empty" })
+      return BATCH_SHAPE_ERROR
+    }
+    if (requests.length > BATCH_MAX_SIZE) {
+      log("decide.batch.fallback", { reason: "over-cap", count: requests.length })
+      return `fallback:true | batch too large: max ${BATCH_MAX_SIZE} requests per batch (got ${requests.length})`
+    }
+    let poolSize = BATCH_DEFAULT_CONCURRENCY
+    if (typeof deps?.concurrency === "number" && Number.isFinite(deps.concurrency)) {
+      poolSize = Math.max(1, Math.floor(deps.concurrency))
+    }
+    const t0 = (deps?.now ?? Date.now)()
+    log("decide.batch.start", { count: requests.length, pool: poolSize })
+    const results: string[] = new Array(requests.length)
+    let next = 0
+    const runOne = async (entry: unknown): Promise<string> => {
+      try {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+          return "fallback:true | batch entry must be an object with state and/or context"
+        }
+        const e = entry as Record<string, unknown>
+        return await decideWithContext(e.state, e.context, e.questions, deps)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        log("decide.batch.fallback", { reason: "entry-exception", error: msg.slice(0, 120) })
+        return `fallback:true | error: ${msg.slice(0, 300)}`
+      }
+    }
+    // Bounded pool: Math.min(poolSize, n) workers share one index counter.
+    // `next++` runs synchronously between awaits, so no entry runs twice and
+    // at most poolSize entries are in flight at any instant.
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = next++
+        if (i >= requests.length) return
+        results[i] = await runOne(requests[i])
+      }
+    }
+    const workers: Array<Promise<void>> = []
+    for (let w = 0; w < Math.min(poolSize, requests.length); w++) workers.push(worker())
+    await Promise.all(workers)
+    let ok = 0
+    let fallback = 0
+    let cached = 0
+    for (const r of results) {
+      if (typeof r === "string" && r.startsWith("fallback:true | ")) {
+        fallback++
+        continue
+      }
+      ok++
+      try {
+        const p = JSON.parse(r) as Record<string, unknown>
+        const jev = (p as Record<string, unknown>)?._jev as Record<string, unknown> | undefined
+        if (jev && jev.cached !== "none") cached++
+      } catch {
+        // Non-JSON success body: counts as ok, never as cached.
+      }
+    }
+    const out = JSON.stringify({
+      results,
+      summary: { total: requests.length, ok, fallback, cached },
+    })
+    log("decide.batch.done", {
+      count: requests.length,
+      ok,
+      fallback,
+      cached,
+      latency_ms: (deps?.now ?? Date.now)() - t0,
+    })
+    return out
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    log("decide.batch.fallback", { reason: "exception", error: msg.slice(0, 120) })
+    return `fallback:true | error: ${msg.slice(0, 300)}`
+  }
+}
+
 // Self-documenting discovery payload. Returned verbatim by the `discover` tool.
 // Budget: serialized JSON must stay <= 1400 chars (see size test) — every
 // value is terse, but all KEY names are frozen (callers depend on them) and
@@ -1001,7 +1118,7 @@ export function discoverPayload() {
     warning_422:
       "questions OBJECT map; array->422.",
     context_note:
-      "context any-key obj; Context+'- \"key\": value', capped.",
+      "context any-key obj; '- \"key\": value', capped.",
     auth_mode:
       "JEV_BEARER=1 opts in; default no Authorization.",
     untrusted_input_note:
@@ -1015,15 +1132,17 @@ export function discoverPayload() {
         "globs ~2.1 vs 'rm -rf /' ~2.96; never gate on one score.",
     },
     answers_note:
-      "_jev.answers: choice{choice,conf,probs} score{score,conf,probs,bucket} noul{noul,bucket}.",
+      "_jev.answers: choice{choice,conf,probs} score{score,conf,probs,bkt} noul{noul,bkt}.",
     confidence_note:
-      "conf<0.5=low_confidence: read probs.",
+      "conf<0.5: read probs.",
+    batch_note:
+      "batch N/round trip; pool4 max8; bad entries fail per-entry.",
     recommended_usage:
       "discover first; assess_risk if risky.",
     response_envelope:
-      "upstream at root + _jev{format,cached,stale,answers,low_confidence}; raw if non-object; else 'fallback:true | '.",
+      "upstream@root + _jev{format,cached,stale,answers,low_confidence}; else 'fallback:true | '; non-obj raw.",
     code_mode_note:
-      "tools[\"jev\"].<tool> via search(\"jev\").",
+      "tools[\"jev\"].<t> via search(\"jev\").",
     examples: {
       decide: { state: "Billing" },
       decide_with_context: {
@@ -1033,7 +1152,6 @@ export function discoverPayload() {
       route_expert: { state: "Plan" },
       assess_risk: {
         state: "Drop users",
-        context: { risk_flags: ["data loss"] },
       },
     },
   }

@@ -399,10 +399,12 @@ describe("discoverPayload key contract", () => {
     const payload = discoverPayload() as Record<string, unknown>;
     // NOTE (jev answers/confidence change): answers_note + confidence_note
     // are INTENTIONAL additions documenting _jev.answers / _jev.low_confidence.
-    // Every previously existing key is still present and none was renamed.
+    // NOTE (jev batch change): batch_note documents the batch tool (pool 4,
+    // max 8). Every previously existing key is still present and none was renamed.
     assert.deepEqual(Object.keys(payload).sort(), [
       "answers_note",
       "auth_mode",
+      "batch_note",
       "code_mode_note",
       "confidence_note",
       "context_note",
@@ -475,9 +477,13 @@ describe("injected metadata budgets (tools/list + discover)", () => {
     // suffixes + prop descriptions x3) plus the new anyOf/additionalProperties
     // schema keys floor the total near ~2500. 2600 still catches any re-bloat
     // (re-adding one JSON example is +130 or more). See commit message.
+    // NOTE (jev batch change): the batch tool adds a fifth entry whose nested
+    // requests/items schema reuses the shared prop descriptions; measured
+    // 3456 after the change, so the bound moves 2600 -> 3500. Same pressure:
+    // any new prose or schema still has to fit in ~44 chars of headroom.
     const tools = await fetchToolsList();
     const len = JSON.stringify({ tools }).length;
-    assert.ok(len <= 2600, `tools/list is ${len} chars (budget 2600)`);
+    assert.ok(len <= 3500, `tools/list is ${len} chars (budget 3500)`);
   });
 
   test("tools/list schemas require state-or-context and forbid extra args", async () => {
