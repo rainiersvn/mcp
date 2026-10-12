@@ -397,9 +397,14 @@ describe("log() structured stderr logging", () => {
 describe("discoverPayload key contract", () => {
   test("top-level KEY names are unchanged (callers depend on them)", () => {
     const payload = discoverPayload() as Record<string, unknown>;
+    // NOTE (jev answers/confidence change): answers_note + confidence_note
+    // are INTENTIONAL additions documenting _jev.answers / _jev.low_confidence.
+    // Every previously existing key is still present and none was renamed.
     assert.deepEqual(Object.keys(payload).sort(), [
+      "answers_note",
       "auth_mode",
       "code_mode_note",
+      "confidence_note",
       "context_note",
       "endpoint",
       "entry_shape",

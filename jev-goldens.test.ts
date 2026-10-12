@@ -22,11 +22,14 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   ADVISORY_TEXT,
+  LOW_CONFIDENCE_THRESHOLD,
   _clearBearerCache,
   _clearJevCache,
   decide,
   defaultQuestions,
+  extractAnswers,
   extractScore,
+  isLowConfidence,
   riskQuestions,
 } from "./jev-core.ts";
 
@@ -143,6 +146,112 @@ describe("golden fixtures: real captured shapes through the pipeline (no network
       assert.deepEqual(parsed.answers, golden.body.answers, `${name}: answers`);
       assert.deepEqual(parsed.usage, golden.body.usage, `${name}: usage`);
     }
+  });
+});
+
+describe("_jev.answers + low_confidence (per-answer confidence, probabilities, noul)", () => {
+  test("route_expert_simple: choice + score surfaced, low_confidence false (0.56 >= 0.5)", async () => {
+    const { parsed } = await runGolden("route_expert_simple");
+    assert.equal(parsed._jev.answers.expert.type, "choice");
+    assert.equal(parsed._jev.answers.expert.choice, "coder");
+    assert.equal(parsed._jev.answers.expert.confidence, 1);
+    assert.deepEqual(parsed._jev.answers.expert.probabilities, { planner: 0, coder: 1, reviewer: 0 });
+    assert.equal(parsed._jev.answers.needs_review.type, "score");
+    assert.equal(parsed._jev.answers.needs_review.score, 2.56);
+    assert.equal(parsed._jev.answers.needs_review.confidence, 0.56);
+    assert.deepEqual(parsed._jev.answers.needs_review.probabilities, { "0": 0, "1": 0.03, "2": 0.38, "3": 0.59 });
+    assert.equal(parsed._jev.answers.needs_review.bucket, "high");
+    assert.equal(parsed._jev.low_confidence, false);
+  });
+
+  test("assess_risk_only: confidence 1 -> low_confidence false", async () => {
+    const { parsed } = await runGolden("assess_risk_only");
+    assert.equal(parsed._jev.answers.needs_review.score, 2.99);
+    assert.equal(parsed._jev.answers.needs_review.confidence, 1);
+    assert.equal(parsed._jev.answers.needs_review.bucket, "high");
+    assert.equal(parsed._jev.low_confidence, false);
+  });
+
+  test("choice_only: choice extracted; needs_review ABSENT from _jev.answers (no invented score)", async () => {
+    const { parsed } = await runGolden("choice_only");
+    assert.equal(parsed._jev.answers.expert.choice, "coder");
+    assert.equal(parsed._jev.answers.expert.confidence, 1);
+    assert.ok(!("needs_review" in parsed._jev.answers), "choice-only payload must not invent a needs_review summary");
+    assert.equal(parsed._jev.low_confidence, false);
+  });
+
+  test("noul_type: verdict carries noul 0.05 + bucket, no score/choice invented, no root bucket", async () => {
+    const { parsed } = await runGolden("noul_type");
+    assert.equal(parsed._jev.answers.verdict.type, "noul");
+    assert.equal(parsed._jev.answers.verdict.noul, 0.05);
+    assert.equal(parsed._jev.answers.verdict.bucket, "low", "noul floats bucket exactly like scores");
+    assert.ok(!("score" in parsed._jev.answers.verdict), "must not invent a score");
+    assert.ok(!("choice" in parsed._jev.answers.verdict), "must not invent a choice");
+    assert.equal("bucket" in parsed, false, "root bucket stays absent when there is no score");
+    assert.equal(parsed._jev.low_confidence, false, "noul carries no confidence, so nothing is low");
+  });
+
+  test("destructive_state: hint true AND score summary present (regression guard)", async () => {
+    const { parsed } = await runGolden("destructive_state");
+    assert.equal(parsed._jev.destructive_hint, true);
+    assert.equal(parsed._jev.answers.needs_review.score, 2.97);
+    assert.equal(parsed._jev.low_confidence, false);
+  });
+
+  test("synthetic: confidence 0.1 -> low_confidence true; exactly 0.5 pins the boundary (false)", async () => {
+    assert.equal(LOW_CONFIDENCE_THRESHOLD, 0.5);
+    const run = async (conf: number) => {
+      _clearJevCache();
+      _clearBearerCache();
+      const body = JSON.stringify({
+        model: "jev-1.13-free",
+        answers: { needs_review: { type: "score", score: 2.0, confidence: conf, probabilities: { "2": 1 } } },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      });
+      const text = await decide("synthetic confidence state", riskQuestions(), {
+        fetchImpl: async () =>
+          new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+        token: "tok-test",
+        now: () => T_NOW,
+        sleep: async (_ms: number) => {},
+        rng: () => 0,
+      });
+      assert.ok(!text.startsWith("fallback:true"), `synthetic conf=${conf} must not fall back`);
+      return JSON.parse(text) as any;
+    };
+    const low = await run(0.1);
+    assert.equal(low._jev.answers.needs_review.confidence, 0.1);
+    assert.equal(low._jev.low_confidence, true);
+    const edge = await run(0.5);
+    assert.equal(edge._jev.low_confidence, false, "confidence exactly at the threshold is NOT low (strict <)");
+  });
+
+  test("missing/malformed upstream degrades gracefully (never crashes, never invents)", async () => {
+    // Pure-function level: null / {} / wrong shapes -> empty map, not low.
+    assert.deepEqual(extractAnswers(null), {});
+    assert.deepEqual(extractAnswers({}), {});
+    assert.deepEqual(extractAnswers({ answers: null }), {});
+    assert.deepEqual(extractAnswers({ answers: [] }), {});
+    assert.deepEqual(extractAnswers({ answers: { q: null } }), { q: { type: "unknown" } });
+    assert.deepEqual(extractAnswers({ answers: { q: { nonsense: 1 } } }), { q: { type: "unknown" } });
+    assert.equal(isLowConfidence({}), false);
+    assert.equal(isLowConfidence(null), false);
+    // Pipeline level: an answers entry missing its type still envelopes.
+    _clearJevCache();
+    _clearBearerCache();
+    const body = JSON.stringify({ model: "jev-1.13-free", answers: { weird: { confidence: 0.1 } }, usage: {} });
+    const text = await decide("malformed answers state", defaultQuestions(), {
+      fetchImpl: async () =>
+        new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+      token: "tok-test",
+      now: () => T_NOW,
+      sleep: async (_ms: number) => {},
+      rng: () => 0,
+    });
+    assert.ok(!text.startsWith("fallback:true"), "malformed answers must envelope, not fall back");
+    const parsed = JSON.parse(text) as any;
+    assert.deepEqual(parsed._jev.answers.weird, { type: "unknown" });
+    assert.equal(parsed._jev.low_confidence, false, "typeless entry carries no confidence to judge");
   });
 });
 
