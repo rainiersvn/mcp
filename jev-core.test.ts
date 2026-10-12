@@ -22,20 +22,36 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CONTEXT_VALUE_TRUNCATION_MARKER,
-  MAX_CONTEXT_VALUE_CHARS,
   MAX_STATE_CHARS,
+  MAX_CONTEXT_VALUE_CHARS,
   TRUNCATION_MARKER,
+  ADVISORY_TEXT,
+  CACHE_CAP,
+  CHOICE_TTL_MS,
+  FIRST_ATTEMPT_TIMEOUT_MS,
+  MAX_ATTEMPTS,
+  OVERALL_BUDGET_MS,
+  SCORE_TTL_MS,
+  _bearerStats,
+  _clearBearerCache,
+  _clearJevCache,
+  _jevCacheSize,
   assessRisk,
+  backoffDelayMs,
+  bucketFor,
+  cacheKeyFor,
   decide,
   decideWithContext,
   defaultQuestions,
   discoverPayload,
+  extractScore,
   log,
   riskQuestions,
   routeExpert,
   serializeState,
   usableContextEntries,
   validateQuestions,
+  wantsScore,
 } from "./jev-core.ts";
 
 const FALLBACK_PREFIX = "fallback:true | ";
@@ -381,6 +397,7 @@ describe("discoverPayload key contract", () => {
       "model",
       "question_types",
       "recommended_usage",
+      "response_envelope",
       "score_semantics",
       "timeout_ms",
       "untrusted_input_note",
@@ -579,6 +596,461 @@ describe("server crash regression (spawns jev-server.ts, no network)", () => {
     } finally {
       finish();
       await new Promise((r) => child.on("close", r));
+    }
+  });
+});
+
+describe("TTL cache layer (offline — injected fetch/time)", () => {
+  let t: number;
+  const now = () => t;
+  const instantSleep = async (_ms: number) => {};
+  const zeroRng = () => 0;
+  const jsonResp = (body: string, status = 200, headers: Record<string, string> = {}) =>
+    new Response(body, { status, headers: { "content-type": "application/json", ...headers } });
+  const okJson = (v: unknown) => jsonResp(JSON.stringify(v), 200);
+  const choiceOnly = () => ({
+    expert: { type: "choice", instructions: "pick", criteria: { a: "A", b: "B" } },
+  });
+  const freshDeps = (fetchImpl: (url: string, init?: RequestInit) => Promise<Response>, token = "tok-test") => ({
+    fetchImpl,
+    token,
+    now,
+    sleep: instantSleep,
+    rng: zeroRng,
+  });
+
+  test("cacheKey: key-order independence; different state => different key", () => {
+    _clearJevCache();
+    _clearBearerCache();
+    const d = defaultQuestions() as Record<string, unknown>;
+    const reordered = { needs_review: d.needs_review, expert: d.expert };
+    assert.equal(cacheKeyFor("same state", d), cacheKeyFor("same state", reordered));
+    assert.notEqual(cacheKeyFor("state A", d), cacheKeyFor("state B", d));
+    assert.notEqual(cacheKeyFor("s", choiceOnly()), cacheKeyFor("s", defaultQuestions()));
+    assert.equal(CHOICE_TTL_MS, 6 * 60 * 60 * 1000);
+    assert.equal(SCORE_TTL_MS, 60_000);
+    assert.ok(wantsScore(defaultQuestions()));
+    assert.ok(wantsScore(riskQuestions()));
+    assert.ok(!wantsScore(choiceOnly()));
+  });
+
+  test("full hit under 60s makes ZERO fetch calls; hit parses as JSON (no prefix)", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 1_000_000;
+    let calls = 0;
+    const deps = freshDeps(async () => {
+      calls++;
+      return okJson({ expert: "coder", needs_review: { score: 1.5 } });
+    });
+    const r1 = await decide("cache-full-state", undefined, deps);
+    assert.equal(calls, 1);
+    assert.ok(!r1.startsWith(FALLBACK_PREFIX));
+    const p1 = JSON.parse(r1) as any;
+    assert.equal(p1._jev.cached, "none");
+    const r2 = await decide("cache-full-state", undefined, deps);
+    assert.equal(calls, 1, "second identical call must not hit the network");
+    assert.ok(!r2.startsWith(FALLBACK_PREFIX), "cache hits are signalled inside JSON, never as a text prefix");
+    const p2 = JSON.parse(r2) as any;
+    assert.equal(p2._jev.cached, "full");
+    assert.equal(p2.expert, "coder", "upstream keys stay spread at root on a hit");
+    assert.ok(p2._jev.cache_age_ms >= 0);
+  });
+
+  test("choice-only hit under 6h makes zero fetch calls", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 2_000_000;
+    let calls = 0;
+    const deps = freshDeps(async () => {
+      calls++;
+      return okJson({ expert: "planner" });
+    });
+    const r1 = await decide("cache-choice-state", choiceOnly(), deps);
+    assert.equal(calls, 1);
+    assert.equal((JSON.parse(r1) as any)._jev.cached, "none");
+    t += 61_000; // past the 60s score TTL but inside the 6h choice TTL
+    const r2 = await decide("cache-choice-state", choiceOnly(), deps);
+    assert.equal(calls, 1, "choice-only request inside 6h must not refetch");
+    assert.equal((JSON.parse(r2) as any)._jev.cached, "choice");
+  });
+
+  test("stale score (past 60s) triggers a fetch and refreshes", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 3_000_000;
+    let calls = 0;
+    const deps = freshDeps(async () => {
+      calls++;
+      return okJson({ expert: "coder", needs_review: { score: 1.4 } });
+    });
+    await decide("cache-stale-state", undefined, deps);
+    assert.equal(calls, 1);
+    t += 61_000;
+    const r2 = await decide("cache-stale-state", undefined, deps);
+    assert.equal(calls, 2, "stale score must refetch");
+    assert.equal((JSON.parse(r2) as any)._jev.cached, "none");
+    const r3 = await decide("cache-stale-state", undefined, deps);
+    assert.equal(calls, 2, "refreshed entry is fresh again");
+    assert.equal((JSON.parse(r3) as any)._jev.cached, "full");
+  });
+
+  test("stale score + fetch failure degrades to cached choice (stale:true), NOT fallback:true", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 4_000_000;
+    let mode = "ok";
+    const deps = freshDeps(async () => {
+      if (mode === "ok") return okJson({ expert: "reviewer", needs_review: { score: 2.2 } });
+      throw new Error("boom: network down");
+    });
+    const r1 = await decide("cache-degrade-state", undefined, deps);
+    assert.equal((JSON.parse(r1) as any).expert, "reviewer");
+    t += 61_000;
+    mode = "fail";
+    const r2 = await decide("cache-degrade-state", undefined, deps);
+    assert.ok(!r2.startsWith(FALLBACK_PREFIX), `degraded hit must not be a fallback: ${r2.slice(0, 80)}`);
+    const p2 = JSON.parse(r2) as any;
+    assert.equal(p2._jev.cached, "choice");
+    assert.equal(p2._jev.stale, true);
+    assert.equal(p2.expert, "reviewer", "degraded hit keeps the cached expert");
+  });
+
+  test("LRU eviction at cap (500): oldest entry goes first", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 5_000_000;
+    assert.ok(CACHE_CAP === 500);
+    let calls = 0;
+    const deps = freshDeps(async () => {
+      calls++;
+      return okJson({ n: calls });
+    });
+    for (let i = 0; i < 501; i++) {
+      await decide(`lru-state-${i}`, choiceOnly(), deps);
+    }
+    assert.equal(calls, 501);
+    assert.equal(_jevCacheSize(), 500);
+    await decide("lru-state-0", choiceOnly(), deps);
+    assert.equal(calls, 502, "oldest entry (state-0) must have been evicted");
+    assert.equal(_jevCacheSize(), 500);
+    await decide("lru-state-500", choiceOnly(), deps);
+    assert.equal(calls, 502, "newest entry must still be cached");
+  });
+
+  test("two concurrent identical calls issue exactly ONE fetch (coalescing)", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 6_000_000;
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const deps = freshDeps(async () => {
+      calls++;
+      await gate;
+      return okJson({ expert: "coder" });
+    });
+    const p1 = decide("coalesce-state", choiceOnly(), deps);
+    const p2 = decide("coalesce-state", choiceOnly(), deps);
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.equal(calls, 1, "coalesced calls must share one network call");
+    assert.equal((JSON.parse(r1) as any).expert, "coder");
+    assert.equal((JSON.parse(r2) as any).expert, "coder");
+  });
+});
+
+describe("bounded retry + cached bearer (offline — injected fetch/time)", () => {
+  let t: number;
+  const now = () => t;
+  const zeroRng = () => 0;
+  const jsonResp = (body: string, status = 200, headers: Record<string, string> = {}) =>
+    new Response(body, { status, headers: { "content-type": "application/json", ...headers } });
+  const okJson = (v: unknown) => jsonResp(JSON.stringify(v), 200);
+
+  test("a 429 then a 200 yields attempts:2", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 10_000_000;
+    let calls = 0;
+    const slept: number[] = [];
+    const deps = {
+      fetchImpl: async () => {
+        calls++;
+        if (calls === 1) return jsonResp('{"error":"limit"}', 429);
+        return okJson({ expert: "coder", score: 1.2 });
+      },
+      token: "tok-test",
+      now,
+      sleep: async (ms: number) => {
+        slept.push(ms);
+      },
+      rng: zeroRng,
+    };
+    const r = await decide("retry-429-state", undefined, deps);
+    assert.equal(calls, 2);
+    const p = JSON.parse(r) as any;
+    assert.equal(p._jev.attempts, 2);
+    assert.equal(p._jev.cached, "none");
+    assert.deepEqual(slept, [300], "first backoff with rng=0 is exactly base 300");
+  });
+
+  test("a 422 does NOT retry", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 11_000_000;
+    let calls = 0;
+    const deps = {
+      fetchImpl: async () => {
+        calls++;
+        return jsonResp("bad shape", 422);
+      },
+      token: "tok-test",
+      now,
+      sleep: async (_ms: number) => {},
+      rng: zeroRng,
+    };
+    const r = await decide("retry-422-state", undefined, deps);
+    assert.equal(calls, 1);
+    assert.ok(r.startsWith(FALLBACK_PREFIX));
+    assert.ok(r.includes("422"));
+  });
+
+  test("a 401 does not retry the fetch but DOES trigger one bearer re-read", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    const tmp = await mkdtemp(join(tmpdir(), "jev-bearer-"));
+    await mkdir(join(tmp, ".local", "share", "opencode"), { recursive: true });
+    await writeFile(join(tmp, ".local", "share", "opencode", "auth.json"), JSON.stringify({ opencode: { key: "key-A" } }), "utf8");
+    const prevHome = process.env.HOME;
+    const prevProfile = process.env.USERPROFILE;
+    process.env.HOME = tmp;
+    process.env.USERPROFILE = tmp;
+    try {
+      t = 12_000_000;
+      let calls = 0;
+      const seenAuth: unknown[] = [];
+      const deps = {
+        fetchImpl: async (_url: string, init?: RequestInit) => {
+          calls++;
+          seenAuth.push((init?.headers as Record<string, unknown>)?.authorization);
+          return new Response("nope", { status: 401 });
+        },
+        now,
+        sleep: async (_ms: number) => {},
+        rng: zeroRng,
+      };
+      const r = await decide("retry-401-state", undefined, deps);
+      assert.equal(calls, 1, "401 must never retry the fetch");
+      assert.equal(seenAuth[0], "Bearer key-A");
+      assert.equal(_bearerStats.fileReads, 2, "initial read + one rotation re-read");
+      assert.equal(_bearerStats.rereads, 1);
+      assert.ok(r.startsWith(FALLBACK_PREFIX));
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = prevProfile;
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("retry honours Retry-After (seconds), capped at 8s", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 13_000_000;
+    const run = async (retryAfter: string) => {
+      _clearJevCache();
+      let calls = 0;
+      const slept: number[] = [];
+      const deps = {
+        fetchImpl: async () => {
+          calls++;
+          if (calls === 1) return jsonResp("slow down", 429, { "retry-after": retryAfter });
+          return okJson({ expert: "coder" });
+        },
+        token: "tok-test",
+        now,
+        sleep: async (ms: number) => {
+          slept.push(ms);
+        },
+        rng: zeroRng,
+      };
+      const r = await decide(`retry-after-${retryAfter}`, undefined, deps);
+      assert.equal((JSON.parse(r) as any)._jev.attempts, 2);
+      return slept;
+    };
+    assert.deepEqual(await run("2"), [2000], "Retry-After: 2 beats the 300ms jitter");
+    assert.deepEqual(await run("100"), [8000], "Retry-After: 100 is capped at 8s");
+  });
+
+  test("total elapsed stays under the 30s budget; backoff bases are 300/600", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 14_000_000;
+    assert.equal(MAX_ATTEMPTS, 3);
+    assert.equal(FIRST_ATTEMPT_TIMEOUT_MS, 8000);
+    assert.equal(OVERALL_BUDGET_MS, 30_000);
+    assert.equal(backoffDelayMs(1, () => 0), 300);
+    assert.equal(backoffDelayMs(2, () => 0), 600);
+    assert.equal(backoffDelayMs(3, () => 0), 1200);
+    let calls = 0;
+    const slept: number[] = [];
+    const deps = {
+      fetchImpl: async () => {
+        calls++;
+        return jsonResp("down", 503);
+      },
+      token: "tok-test",
+      now,
+      sleep: async (ms: number) => {
+        slept.push(ms);
+      },
+      rng: zeroRng,
+    };
+    const wall0 = Date.now();
+    const r = await decide("retry-budget-state", undefined, deps);
+    const elapsed = Date.now() - wall0;
+    assert.equal(calls, 3, "503 retries up to the 3-attempt max");
+    assert.deepEqual(slept, [300, 600]);
+    assert.ok(r.startsWith(FALLBACK_PREFIX));
+    assert.ok(elapsed < 30_000, `wall elapsed ${elapsed}ms must stay under the 30s budget`);
+  });
+});
+
+describe("response envelope (offline — injected fetch)", () => {
+  let t: number;
+  const now = () => t;
+  const okJson = (v: unknown) =>
+    new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } });
+
+  test("upstream keys present at root; _jev present with all fields + advisory", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 20_000_000;
+    const deps = {
+      fetchImpl: async () => okJson({ expert: "coder", needs_review: { score: 2.5 }, extra: 7 }),
+      token: "tok-test",
+      now,
+      sleep: async (_ms: number) => {},
+      rng: () => 0,
+    };
+    const r = await decide("envelope-state", undefined, deps);
+    assert.ok(!r.startsWith(FALLBACK_PREFIX));
+    const p = JSON.parse(r) as any;
+    assert.equal(p.expert, "coder", "upstream keys spread at root");
+    assert.equal(p.extra, 7);
+    assert.deepEqual(p.needs_review, { score: 2.5 });
+    assert.equal(p._jev.format, 1);
+    assert.equal(p._jev.cached, "none");
+    assert.equal(p._jev.cache_age_ms, 0);
+    assert.equal(p._jev.attempts, 1);
+    assert.equal(typeof p._jev.latency_ms, "number");
+    assert.equal(p._jev.stale, false);
+    assert.equal(p._jev.advisory, ADVISORY_TEXT);
+    assert.ok(p._jev.advisory.includes("Never gate irreversible actions"), "advisory on EVERY response");
+    assert.equal(p.bucket, "high");
+    assert.equal(p._jev.destructive_hint, false);
+  });
+
+  test("bucket boundaries exactly at 1 and 2", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 21_000_000;
+    const cases: Array<[number, string]> = [
+      [0.9, "low"],
+      [1, "low"],
+      [1.1, "medium"],
+      [2, "medium"],
+      [2.1, "high"],
+    ];
+    for (const [score, want] of cases) {
+      const deps = {
+        fetchImpl: async () => okJson({ score }),
+        token: "tok-test",
+        now,
+        sleep: async (_ms: number) => {},
+        rng: () => 0,
+      };
+      const p = JSON.parse(await decide(`bucket-state-${score}`, undefined, deps)) as any;
+      assert.equal(p.bucket, want, `score ${score} must bucket as ${want}`);
+    }
+    assert.equal(bucketFor(1), "low");
+    assert.equal(bucketFor(2), "medium");
+    assert.equal(extractScore({ needs_review: { score: 1.7 } }), 1.7);
+  });
+
+  test("upstream bucket is never overwritten", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 22_000_000;
+    const deps = {
+      fetchImpl: async () => okJson({ score: 9, bucket: "custom" }),
+      token: "tok-test",
+      now,
+      sleep: async (_ms: number) => {},
+      rng: () => 0,
+    };
+    const p = JSON.parse(await decide("bucket-keep-state", undefined, deps)) as any;
+    assert.equal(p.bucket, "custom");
+  });
+
+  test("non-object upstream wraps under raw and does not throw", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 23_000_000;
+    const mk = (body: string) => ({
+      fetchImpl: async () => new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+      token: "tok-test",
+      now,
+      sleep: async (_ms: number) => {},
+      rng: () => 0,
+    });
+    const pStr = JSON.parse(await decide("raw-string-state", undefined, mk(JSON.stringify("just a string")))) as any;
+    assert.equal(pStr.raw, "just a string");
+    assert.equal(pStr._jev.format, 1);
+    const pNum = JSON.parse(await decide("raw-num-state", undefined, mk("42"))) as any;
+    assert.equal(pNum.raw, 42);
+    assert.equal(pNum._jev.format, 1);
+  });
+
+  test("destructive shapes set _jev.destructive_hint (hint only, no escalation)", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    t = 24_000_000;
+    const runHint = (state: string) =>
+      decide(state, undefined, {
+        fetchImpl: async () => okJson({ expert: "coder" }),
+        token: "tok-test",
+        now,
+        sleep: async (_ms: number) => {},
+        rng: () => 0,
+      });
+    const flagged = [
+      "please rm -rf /tmp/cache",
+      "DROP TABLE users",
+      "truncate the audit log",
+      "delete everything *",
+      "git force-push origin",
+    ];
+    let i = 0;
+    for (const s of flagged) {
+      const p = JSON.parse(await runHint(`destructive-shape-${i++} ${s}`)) as any;
+      assert.equal(p._jev.destructive_hint, true, `"${s}" must flag the hint`);
+      assert.equal(p.expert, "coder", "hint must not change the decision itself");
+    }
+    const pBenign = JSON.parse(await runHint("refactor the auth module")) as any;
+    assert.equal(pBenign._jev.destructive_hint, false);
+  });
+
+  test("discover documents the envelope without dropping existing keys", () => {
+    const payload = discoverPayload() as Record<string, unknown>;
+    assert.ok("response_envelope" in payload);
+    assert.ok(String(payload.response_envelope).includes("_jev"));
+    for (const k of ["model", "endpoint", "timeout_ms", "question_types", "score_semantics", "recommended_usage"]) {
+      assert.ok(k in payload, `existing key ${k} must survive`);
     }
   });
 });

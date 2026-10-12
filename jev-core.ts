@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs"
+import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -340,7 +341,240 @@ export function serializeState(state?: unknown, context?: unknown): string {
   }
 }
 
-export async function decide(state: string, questions?: unknown): Promise<string> {
+// ---------------------------------------------------------------------------
+// TTL CACHE + BOUNDED RETRY + RESPONSE ENVELOPE
+//
+// Cache: the expert CHOICE is stable across repeats (see score_semantics in
+// discoverPayload) so it is safe to cache 6h; scores jitter (sd ~0.025) and
+// cannot cross a bucket boundary in 60s, so scores are cached 60s.
+// IN-MEMORY ONLY: one stdio process per session, high key cardinality, short
+// score TTL — an on-disk cache file adds a corruption failure mode for no
+// gain. Do NOT "improve" this into a file cache.
+// Retry: 3 attempts max inside an overall 30s wall-clock budget; first
+// attempt times out at 8s, later attempts share the remaining budget, and
+// backoff sleeps are capped by the remaining budget too, so the worst case
+// stays under 30s. Retry ONLY 429/500/502/503/504 + network/timeout errors;
+// NEVER 401/403/422 (bad key or client shape error — retrying is pointless
+// load). Retry-After (seconds or HTTP-date) is honoured, capped at 8s.
+// Envelope: success returns the upstream object spread at root plus a
+// namespaced `_jev` object; failures keep the `fallback:true | ` string.
+// ---------------------------------------------------------------------------
+export const CHOICE_TTL_MS = 6 * 60 * 60 * 1000 // 6h (expert choice)
+export const SCORE_TTL_MS = 60 * 1000 // 60s (scores)
+export const CACHE_CAP = 500 // LRU cap; oldest evicted on overflow
+export const MAX_ATTEMPTS = 3
+export const FIRST_ATTEMPT_TIMEOUT_MS = 8_000
+export const OVERALL_BUDGET_MS = 30_000
+export const BEARER_CACHE_TTL_MS = 60 * 1000
+export const RETRY_AFTER_CAP_MS = 8_000
+export const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([429, 500, 502, 503, 504])
+export const ADVISORY_TEXT = "Never gate irreversible actions on this score alone."
+
+// Testability seam. All fields optional; omitting `deps` entirely preserves
+// the production path (global fetch, Date.now, real sleep, Math.random).
+export interface DecideDeps {
+  fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>
+  token?: string
+  now?: () => number
+  sleep?: (ms: number) => Promise<void>
+  rng?: () => number
+}
+
+// Canonical JSON: object keys sorted recursively, so key ORDER in the
+// questions object cannot fragment the cache. Arrays keep their order.
+function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null"
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`
+  const o = v as Record<string, unknown>
+  return `{${Object.keys(o)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`)
+    .join(",")}}`
+}
+
+// Exact-match cache key: sha256 of MODEL + canonical questions + RAW state
+// (the state string as passed to decide, before any further framing). NO
+// semantic/fuzzy matching — a reworded question is legitimately a new key.
+export function cacheKeyFor(state: string, questions: unknown): string {
+  return createHash("sha256").update(`${MODEL}\n${canonicalJson(questions)}\n${state}`, "utf8").digest("hex")
+}
+
+// "wants a score" = the questions object contains an entry with type "score".
+export function wantsScore(questions: unknown): boolean {
+  if (questions === null || typeof questions !== "object" || Array.isArray(questions)) return false
+  return Object.values(questions as Record<string, unknown>).some(
+    (q) => q !== null && typeof q === "object" && !Array.isArray(q) && (q as Record<string, unknown>).type === "score",
+  )
+}
+
+type CacheEntry = { upstream: unknown; at: number }
+const jevCache = new Map<string, CacheEntry>()
+const jevInflight = new Map<string, Promise<string>>()
+
+function touchCache(key: string, entry: CacheEntry): void {
+  jevCache.delete(key)
+  jevCache.set(key, entry)
+}
+
+function storeCache(key: string, upstream: unknown, at: number): void {
+  if (!jevCache.has(key) && jevCache.size >= CACHE_CAP) {
+    const oldest = jevCache.keys().next()
+    if (!oldest.done) jevCache.delete(oldest.value)
+  } else {
+    jevCache.delete(key)
+  }
+  jevCache.set(key, { upstream, at })
+}
+
+export function _clearJevCache(): void {
+  jevCache.clear()
+  jevInflight.clear()
+}
+
+export function _jevCacheSize(): number {
+  return jevCache.size
+}
+
+// In-process bearer cache (60s TTL) so auth.json is not re-read + re-parsed
+// on every request. Refreshed once on a 401 (handles key rotation).
+export const _bearerStats = { fileReads: 0, rereads: 0, cacheHits: 0 }
+let bearerCache: { token: string; at: number } | null = null
+
+export function _clearBearerCache(): void {
+  bearerCache = null
+  _bearerStats.fileReads = 0
+  _bearerStats.rereads = 0
+  _bearerStats.cacheHits = 0
+}
+
+async function getBearer(deps: DecideDeps | undefined, nowMs: number): Promise<string> {
+  if (deps?.token !== undefined) return deps.token
+  if (bearerCache && nowMs - bearerCache.at < BEARER_CACHE_TTL_MS) {
+    _bearerStats.cacheHits++
+    return bearerCache.token
+  }
+  const t = await readBearerKey()
+  _bearerStats.fileReads++
+  bearerCache = { token: t, at: nowMs }
+  return t
+}
+
+async function refreshBearerOnce(nowMs: number): Promise<void> {
+  _bearerStats.rereads++
+  try {
+    const t = await readBearerKey()
+    _bearerStats.fileReads++
+    bearerCache = { token: t, at: nowMs }
+  } catch {
+    // Keep the old cache; the caller falls back without retrying.
+  }
+}
+
+// Exponential backoff with FULL JITTER: base + random()*base,
+// base = min(300 * 2**(attempt-1), 3000). rng is injectable for tests.
+export function backoffDelayMs(attempt: number, rng: () => number): number {
+  const base = Math.min(300 * 2 ** (attempt - 1), 3000)
+  return base + rng() * base
+}
+
+// Retry-After in ms, capped at 8s. Accepts delta-seconds or an HTTP-date
+// (datediff vs now); garbage or past dates yield 0. Never throws.
+export function parseRetryAfterMs(headers: Headers, nowMs: number): number {
+  try {
+    const raw = headers.get("retry-after")
+    if (!raw) return 0
+    const s = raw.trim()
+    if (/^\d+$/.test(s)) return Math.min(Number(s) * 1000, RETRY_AFTER_CAP_MS)
+    const t = Date.parse(s)
+    if (!Number.isNaN(t)) return Math.max(0, Math.min(t - nowMs, RETRY_AFTER_CAP_MS))
+  } catch {
+    // ignore malformed headers
+  }
+  return 0
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false
+  const p = Object.getPrototypeOf(v)
+  return p === Object.prototype || p === null
+}
+
+// Best-effort score extraction for the `bucket` label: a top-level `score`
+// number, any *-score* numeric field, or a nested `{score: n}` one level
+// down (e.g. needs_review: {score: 2.1}). Absent when nothing numeric fits.
+export function extractScore(upstream: unknown): number | undefined {
+  if (typeof upstream === "number" && Number.isFinite(upstream)) return upstream
+  if (upstream === null || typeof upstream !== "object" || Array.isArray(upstream)) return undefined
+  const o = upstream as Record<string, unknown>
+  if (typeof o.score === "number" && Number.isFinite(o.score)) return o.score
+  for (const [k, v] of Object.entries(o)) {
+    if (/score/i.test(k) && typeof v === "number" && Number.isFinite(v)) return v
+    if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+      const inner = (v as Record<string, unknown>).score
+      if (typeof inner === "number" && Number.isFinite(inner)) return inner
+    }
+  }
+  return undefined
+}
+
+export function bucketFor(score: number): "low" | "medium" | "high" {
+  return score <= 1 ? "low" : score <= 2 ? "medium" : "high"
+}
+
+// HINT, not an auto-escalation: true when the caller-visible state carries a
+// destructive shape, forcing the caller to seek a second signal. The wrapper
+// itself never makes the decision.
+export function destructiveHint(state: string): boolean {
+  return (
+    /rm\s+-rf/i.test(state) ||
+    /drop\s+table/i.test(state) ||
+    /\btruncate\b/i.test(state) ||
+    /delete\b[\s\S]*\*/.test(state) ||
+    /force-push/i.test(state)
+  )
+}
+
+export interface JevMeta {
+  cached: "none" | "full" | "choice"
+  cache_age_ms: number
+  attempts: number
+  latency_ms: number
+  stale: boolean
+}
+
+// Success envelope: upstream keys SPREAD AT ROOT (existing key paths keep
+// working) plus namespaced `_jev`. Non-object upstream (string/number/array)
+// is wrapped under `raw` instead of crashing on the spread.
+function buildEnvelope(upstream: unknown, meta: JevMeta, state: string): string {
+  const jev = {
+    format: 1,
+    cached: meta.cached,
+    cache_age_ms: meta.cache_age_ms,
+    attempts: meta.attempts,
+    latency_ms: meta.latency_ms,
+    stale: meta.stale,
+    advisory: ADVISORY_TEXT,
+    destructive_hint: destructiveHint(state),
+  }
+  const score = extractScore(upstream)
+  if (isPlainObject(upstream)) {
+    const out: Record<string, unknown> = { ...(upstream as Record<string, unknown>) }
+    if (!("bucket" in out) && score !== undefined) out.bucket = bucketFor(score)
+    out._jev = jev
+    return JSON.stringify(out)
+  }
+  const out: Record<string, unknown> = { raw: upstream }
+  if (score !== undefined) out.bucket = bucketFor(score)
+  out._jev = jev
+  return JSON.stringify(out)
+}
+
+export async function decide(state: string, questions?: unknown, deps?: DecideDeps): Promise<string> {
+  const nowFn = deps?.now ?? Date.now
+  const sleepFn = deps?.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const rngFn = deps?.rng ?? Math.random
+  const fetchFn = deps?.fetchImpl ?? ((url: string, init?: RequestInit) => fetch(url, init))
+  const t0 = nowFn()
   try {
     if (typeof state !== "string" || state.trim().length === 0) {
       log("decide.fallback", {
@@ -366,51 +600,164 @@ export async function decide(state: string, questions?: unknown): Promise<string
     }
     log("decide.start", { state_chars: state.length, caller_questions: callerSupplied })
     const q = questions ?? defaultQuestions()
-    let token: string
-    try {
-      token = await readBearerKey()
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      log("auth.error", { error: msg.slice(0, 120), state_chars: state.length })
-      return `fallback:true | error: ${msg.slice(0, 300)}`
+    const key = cacheKeyFor(state, q)
+    const needScore = wantsScore(q)
+
+    // Cache lookup AFTER validation, BEFORE any network.
+    const held = jevCache.get(key)
+    const heldAge = held ? t0 - held.at : -1
+    const heldUsable = !!held && heldAge < CHOICE_TTL_MS
+    if (held && heldAge < SCORE_TTL_MS && needScore) {
+      touchCache(key, held)
+      const text = buildEnvelope(
+        held.upstream,
+        { cached: "full", cache_age_ms: heldAge, attempts: 0, latency_ms: nowFn() - t0, stale: false },
+        state,
+      )
+      log("decide.done", { state_chars: state.length, response_chars: text.length, cached: "full" })
+      return text
     }
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ model: MODEL, state, questions: q }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    })
-    if (!res.ok) {
-      const body = await res.text().catch(() => "")
-      log("decide.fallback", { reason: `http-${res.status}`, state_chars: state.length })
-      if (res.status === 422) {
-        return `fallback:true | HTTP 422 (client-side shape error, not an outage): ${body.slice(0, 500)}`
-      }
-      return `fallback:true | HTTP ${res.status}: ${body.slice(0, 500)}`
+    if (held && heldAge < CHOICE_TTL_MS && !needScore) {
+      touchCache(key, held)
+      const text = buildEnvelope(
+        held.upstream,
+        { cached: "choice", cache_age_ms: heldAge, attempts: 0, latency_ms: nowFn() - t0, stale: false },
+        state,
+      )
+      log("decide.done", { state_chars: state.length, response_chars: text.length, cached: "choice" })
+      return text
     }
-    const data: unknown = await res.json().catch(() => null)
-    if (data === null || data === undefined) {
-      log("decide.fallback", { reason: "empty-upstream", state_chars: state.length })
-      return "fallback:true | empty upstream response"
-    }
-    if (typeof data === "string") {
+    // Otherwise (miss, or stale score under a live choice) fall through to a
+    // fresh fetch, HOLDING `held` as the degrade prior: if the fetch fails we
+    // return the cached choice flagged stale instead of a hard fallback. The
+    // request shape itself is unchanged — the prior is carried only as this
+    // fallback, never injected into the body (an extra field risks a 422
+    // from a strict upstream).
+
+    // In-flight coalescing: an identical key already fetching shares ONE
+    // network call instead of issuing two.
+    const inflight = jevInflight.get(key)
+    if (inflight) return await inflight
+
+    const degraded = (attempts: number): string => {
+      const age = nowFn() - (held?.at ?? nowFn())
+      const text = buildEnvelope(
+        held!.upstream,
+        { cached: "choice", cache_age_ms: age, attempts, latency_ms: nowFn() - t0, stale: true },
+        state,
+      )
+      touchCache(key, held!)
       log("decide.done", {
         state_chars: state.length,
-        response_chars: data.length,
-        key_prefix: token.slice(0, 8),
+        response_chars: text.length,
+        cached: "choice",
+        stale: true,
       })
-      return data
+      return text
     }
-    const text = JSON.stringify(data)
-    log("decide.done", {
-      state_chars: state.length,
-      response_chars: text.length,
-      key_prefix: token.slice(0, 8),
-    })
-    return text
+
+    const task = (async (): Promise<string> => {
+      let token: string
+      try {
+        token = await getBearer(deps, nowFn())
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        log("auth.error", { error: msg.slice(0, 120), state_chars: state.length })
+        if (heldUsable) return degraded(0)
+        return `fallback:true | error: ${msg.slice(0, 300)}`
+      }
+      const deadline = t0 + OVERALL_BUDGET_MS
+      let attempts = 0
+      let lastFallback = "fallback:true | error: upstream request failed"
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        if (deadline - nowFn() <= 0) break
+        attempts++
+        const remaining = deadline - nowFn()
+        const timeoutMs = attempt === 1 ? Math.min(FIRST_ATTEMPT_TIMEOUT_MS, remaining) : remaining
+        let res: Response
+        try {
+          res = await fetchFn(ENDPOINT, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ model: MODEL, state, questions: q }),
+            signal: AbortSignal.timeout(timeoutMs),
+          })
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (attempt < MAX_ATTEMPTS) {
+            const delay = Math.min(backoffDelayMs(attempt, rngFn), Math.max(0, deadline - nowFn()))
+            log("decide.retry", { attempt, error: msg.slice(0, 120) })
+            if (delay > 0) await sleepFn(delay)
+            continue
+          }
+          log("decide.fallback", { reason: "exception", error: msg.slice(0, 120) })
+          lastFallback = `fallback:true | error: ${msg.slice(0, 300)}`
+          break
+        }
+        if (res.ok) {
+          const data: unknown = await res.json().catch(() => null)
+          if (data === null || data === undefined) {
+            log("decide.fallback", { reason: "empty-upstream", state_chars: state.length })
+            lastFallback = "fallback:true | empty upstream response"
+            break
+          }
+          const stamped = nowFn()
+          storeCache(key, data, stamped)
+          const text = buildEnvelope(
+            data,
+            { cached: "none", cache_age_ms: 0, attempts, latency_ms: stamped - t0, stale: false },
+            state,
+          )
+          log("decide.done", {
+            state_chars: state.length,
+            response_chars: text.length,
+            key_prefix: token.slice(0, 8),
+            attempts,
+          })
+          return text
+        }
+        const status = res.status
+        const body = await res.text().catch(() => "")
+        if (status === 422) {
+          log("decide.fallback", { reason: `http-${status}`, state_chars: state.length })
+          lastFallback = `fallback:true | HTTP 422 (client-side shape error, not an outage): ${body.slice(0, 500)}`
+          break
+        }
+        if (status === 401 || status === 403) {
+          log("decide.fallback", { reason: `http-${status}`, state_chars: state.length })
+          if (status === 401 && deps?.token === undefined) {
+            // Key rotation: refresh the cached bearer once for the NEXT
+            // call. The fetch itself is NOT retried (bad key + retry =
+            // pointless load).
+            await refreshBearerOnce(nowFn())
+          }
+          lastFallback = `fallback:true | HTTP ${status}: ${body.slice(0, 500)}`
+          break
+        }
+        if (RETRYABLE_STATUSES.has(status) && attempt < MAX_ATTEMPTS) {
+          const jitter = backoffDelayMs(attempt, rngFn)
+          const retryAfter = parseRetryAfterMs(res.headers, nowFn())
+          const delay = Math.min(Math.max(jitter, retryAfter), Math.max(0, deadline - nowFn()))
+          log("decide.retry", { attempt, status, delay_ms: Math.round(delay) })
+          if (delay > 0) await sleepFn(delay)
+          continue
+        }
+        log("decide.fallback", { reason: `http-${status}`, state_chars: state.length })
+        lastFallback = `fallback:true | HTTP ${status}: ${body.slice(0, 500)}`
+        break
+      }
+      if (heldUsable) return degraded(attempts)
+      return lastFallback
+    })()
+    jevInflight.set(key, task)
+    try {
+      return await task
+    } finally {
+      jevInflight.delete(key)
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     log("decide.fallback", { reason: "exception", error: msg.slice(0, 120) })
@@ -424,9 +771,10 @@ export async function decideWithContext(
   state?: unknown,
   context?: unknown,
   questions?: unknown,
+  deps?: DecideDeps,
 ): Promise<string> {
   try {
-    return await decide(serializeState(state, context), questions)
+    return await decide(serializeState(state, context), questions, deps)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     log("decide.fallback", { reason: "context-exception", error: msg.slice(0, 120) })
@@ -435,13 +783,13 @@ export async function decideWithContext(
 }
 
 // Convenience: route to expert(s) with default questions.
-export async function routeExpert(state?: unknown, context?: unknown): Promise<string> {
-  return decideWithContext(state, context, defaultQuestions())
+export async function routeExpert(state?: unknown, context?: unknown, deps?: DecideDeps): Promise<string> {
+  return decideWithContext(state, context, defaultQuestions(), deps)
 }
 
 // Convenience: score blast radius / review need only.
-export async function assessRisk(state?: unknown, context?: unknown): Promise<string> {
-  return decideWithContext(state, context, riskQuestions())
+export async function assessRisk(state?: unknown, context?: unknown, deps?: DecideDeps): Promise<string> {
+  return decideWithContext(state, context, riskQuestions(), deps)
 }
 
 // Self-documenting discovery payload. Returned verbatim by the `discover` tool.
@@ -487,6 +835,8 @@ export function discoverPayload() {
     },
     recommended_usage:
       "call discover first when unsure; use assess_risk before risky changes; bucketize scores (<=1 low, <=2 medium, >2 high), never branch on decimals; treat the expert choice as cacheable across repeats.",
+    response_envelope:
+      "success returns the upstream JSON object SPREAD AT ROOT (existing key paths keep working) plus a namespaced `_jev` object {format:1, cached:none|full|choice, cache_age_ms, attempts, latency_ms, stale, advisory, destructive_hint}. `advisory` is always 'Never gate irreversible actions on this score alone.' `bucket` (low<=1, medium<=2, high>2) is added at root only when a score is present and upstream set none. non-object upstream is wrapped under `raw`. failures keep the `fallback:true | ` string prefix. cache hits are signalled inside `_jev.cached`, never as a text prefix (a prefix would break JSON.parse).",
     code_mode_note:
       "In Code Mode sessions call via tools[\"jev\"].<tool> after resolving the path with search({query:\"jev\"}).",
     examples: {
