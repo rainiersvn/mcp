@@ -826,6 +826,31 @@ export function isLowConfidence(answers: unknown): boolean {
 //   in practice); a verb and an extension in unrelated clauses can still
 //   coincide — accepted, documented, and strictly tighter than the existing
 //   unbounded wildcard lookaheads.
+// - BATTLE-TEST EXTENSION (recall 8/10 -> target 10/10, precision held at
+//   100%): the two live misses were "remove all the generated files
+//   recursively" (recursion said in PROSE, not via an `rm -r` flag) and
+//   "Rotate the production API secret in all deployments" (credential
+//   operations were not covered at all). The composite needs_second_signal
+//   gate still caught both, so these two families close coverage gaps, not
+//   safety holes — same under-match discipline as every family above:
+// - `prose-recursion` needs a destructive verb + a prose recursion cue
+//   within 80 chars either order. The verb is what separates operations from
+//   programming concepts: "the recursive function walks the tree" and
+//   "write a recursive descent parser" stay silent (no destructive verb;
+//   common programming nouns after bare `recursive` are additionally
+//   guarded). `clean` stays excluded (ubiquitous benign prose); `clear` is
+//   included because "clear ... recursively" names a bulk operation while
+//   bare "clear the screen" stays silent for lack of a cue.
+// - `credential-operations` needs a credential verb + a credential noun
+//   within 80 chars either order, bare pair included (revoking a live token
+//   is worth a second look regardless of scope words). Highest
+//   false-positive risk in the catalogue, so both sides are strict word
+//   shapes: `reset` is NOT a credential verb ("reset the password" stays
+//   silent), bare `key` needs a verb beside it ("the key to success" stays
+//   silent), and `\b` keeps "tokenize" (lexer sense) from matching `token`.
+//   Nominalizations stay verb-only except `rotation` ("secret rotation" is
+//   the canonical noun phrasing); other -ion/-ment forms stay silent
+//   pending evidence.
 // Case-insensitive throughout; `\s+` tolerates any spacing; nothing is `^`
 // anchored so an imperative verb fires mid-sentence as well as at the start.
 // ---------------------------------------------------------------------------
@@ -863,6 +888,30 @@ const DESTRUCTIVE_ARTIFACT_FILE = String.raw`[\w-]+\.(?:tmp|temp|logs?|baks?|bac
 // no "./", "index" is not an artifact dirname) — deliberate under-match.
 const DESTRUCTIVE_DIR_WORD = String.raw`\b(?:director(?:y|ies)|dirs?|folders?)\b`
 const DESTRUCTIVE_PATH = String.raw`(?:[\w.-]*\/\.[\w-]+[\w./-]*|\.\/[\w./-]+|[\w./-]*\/(?:tmp|temp|cache|logs?)(?![\w-])[\w./-]*)`
+// Battle-test extension (recall 8/10 -> target 10/10, precision held at 100%):
+// prose recursion cues and credential nouns. See the FALSE-POSITIVE TRADE-OFF
+// block above for the per-family discipline.
+// Prose-recursion verb: the task-list verbs only
+// (delete/remove/wipe/purge/clear/rm/unlink, base + ed/es/ing). `clean` is
+// deliberately NOT here (see above); `nuke` is not added either — the family
+// follows the battle-test task list exactly, and `rm -rf`-style flags keep
+// their own family.
+const PROSE_RECURSION_VERB = String.raw`\b(?:rm|delet(?:e|ed|es|ing)|remov(?:e|ed|es|ing)|wip(?:e|ed|es|ing)|purg(?:e|ed|es|ing)|clear(?:ed|s|ing)?|unlink(?:ed|s|ing)?)\b`
+// Prose recursion cue: the adverb `recursively`; bare `recursive` guarded
+// against programming nouns (function/descent/fibonacci/...); `and|all` +
+// subdirectories; `nested` directories; `whole|entire` (directory) tree.
+// Bare `tree`/`directory` alone is NOT a cue ("recurse through the directory
+// tree" stays silent); neither is bare `recurse` (iteration sense, no cue).
+const PROSE_RECURSION_CUE = String.raw`(?:\brecursively\b|\brecursive\b(?!\s+(?:functions?|descent|fibonacci|calls?|algorithms?|parsers?|routines?|procedures?|definitions?)\b)|\b(?:and|all)\s+subdirector(?:y|ies)\b|\bnested\s+director(?:y|ies)\b|\b(?:whole|entire)\s+(?:directory\s+)?trees?\b)`
+// Credential verb: rotate (+rotation noun form) / revoke / replace /
+// regenerate / invalidate / expire, base + ed/es/ing. `reset` is deliberately
+// NOT here: "reset the password" is routine account prose, and admitting it
+// would fire the hint on every password-reset mention.
+const CREDENTIAL_VERB = String.raw`\b(?:rotat(?:e|ed|es|ing|ion)|revok(?:e|ed|es|ing)|replac(?:e|ed|es|ing)|regenerat(?:e|ed|es|ing)|invalidat(?:e|ed|es|ing)|expir(?:e|ed|es|ing))\b`
+// Credential noun: api-key (glued/spaced/hyphenated) / secret / token /
+// password / credential / bare key, singular or plural. Word boundaries both
+// sides: "tokenize" (lexer sense), "keyboard", and "monkey" never match.
+const CREDENTIAL_NOUN = String.raw`(?:\bapi[\s-_]*keys?\b|\bsecrets?\b|\btokens?\b|\bpasswords?\b|\bcredentials?\b|\bkeys?\b)`
 
 export interface DestructivePattern {
   // Stable family id — tests cover each family individually through this list.
@@ -975,6 +1024,22 @@ export const DESTRUCTIVE_PATTERNS: DestructivePattern[] = [
     why: "strong OR cleanup verb + slash-path with deletion signal within 80 chars either order ('remove ./tmp', 'clean build/.cache', 'clear dist/.cache'); 'update ./.config/opencode' stays silent (update is not a destructive/cleanup verb).",
     pattern: new RegExp(
       `(?:(?:${DESTRUCTIVE_VERB}|${CLEANUP_VERB})[\\s\\S]{0,80}?${DESTRUCTIVE_PATH}|${DESTRUCTIVE_PATH}[\\s\\S]{0,80}?(?:${DESTRUCTIVE_VERB}|${CLEANUP_VERB}))`,
+      "i",
+    ),
+  },
+  {
+    name: "prose-recursion",
+    why: "destructive verb + prose recursion cue within 80 chars either order ('remove all files recursively', 'delete the whole tree'); bare 'recursive function/descent/fibonacci' stays silent (no verb, plus programming-noun guard).",
+    pattern: new RegExp(
+      `(?:${PROSE_RECURSION_VERB}[\\s\\S]{0,80}?${PROSE_RECURSION_CUE}|${PROSE_RECURSION_CUE}[\\s\\S]{0,80}?${PROSE_RECURSION_VERB})`,
+      "i",
+    ),
+  },
+  {
+    name: "credential-operations",
+    why: "credential verb + credential noun within 80 chars either order ('rotate the production API secret', 'revoke the token'); 'rotate the wheel', 'key to success', 'tokenize', 'password manager' stay silent (each lacks one side of the pair).",
+    pattern: new RegExp(
+      `(?:${CREDENTIAL_VERB}[\\s\\S]{0,80}?${CREDENTIAL_NOUN}|${CREDENTIAL_NOUN}[\\s\\S]{0,80}?${CREDENTIAL_VERB})`,
       "i",
     ),
   },

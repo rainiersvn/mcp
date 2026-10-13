@@ -4,7 +4,7 @@
 //   - the DESTRUCTIVE_PATTERNS catalogue: every family individually
 //     (rm-recursive-force, wildcard x3, sql x3, vcs x3, disk x3,
 //      extension-delete, filename-delete, extension-cleanup-dir,
-//      path-segment-cleanup)
+//      path-segment-cleanup, prose-recursion, credential-operations)
 //   - REGRESSION guards for the two confirmed live misses:
 //     "Delete every *.tmp file in the workspace" and "remove *.log"
 //   - REGRESSION guards for the extension-style live misses (tmp-clearing
@@ -46,11 +46,16 @@ function assertSilent(name: string, states: string[]): void {
 }
 
 describe("destructiveHint catalogue (each family individually)", () => {
-  test("all seventeen families are exported with a name, why, and RegExp", () => {
+  test("all nineteen families are exported with a name, why, and RegExp", () => {
     // NOTE (extension-style change): was thirteen families; the four appended
     // entries below are the DELIBERATE catalogue extension for extension-style
     // and named deletion targets (no literal `*`). The original thirteen keep
     // their names, order, and behaviour — see git history.
+    // NOTE (battle-test change): was seventeen families; the two appended
+    // entries (prose-recursion, credential-operations) close the two live
+    // misses from the 20-scenario battle test (recall 8/10 -> target 10/10,
+    // precision held at 100%). The original seventeen keep their names,
+    // order, and behaviour.
     assert.deepEqual(
       DESTRUCTIVE_PATTERNS.map((p) => p.name),
       [
@@ -71,6 +76,8 @@ describe("destructiveHint catalogue (each family individually)", () => {
         "filename-delete",
         "extension-cleanup-dir",
         "path-segment-cleanup",
+        "prose-recursion",
+        "credential-operations",
       ],
     );
   });
@@ -361,6 +368,98 @@ describe("extension-style deletion targets (no literal `*`)", () => {
       pattern.lastIndex = 0;
       const h2 = pattern.test(hit);
       assert.equal(h, h2, `[${name}] must give stable results across consecutive .test() calls`);
+    }
+  });
+});
+
+describe("battle-test extension: prose recursion + credential operations", () => {
+  test("prose-recursion: destructive verb + recursion cue, either order", () => {
+    assertFires("prose-recursion", [
+      // Battle miss A9 (regression guard lives at the wrapper level below).
+      "remove all the generated files recursively",
+      "delete the whole tree",
+      "wipe the entire directory tree",
+      "purge the nested directories",
+      "clear all subdirectories",
+      "delete the build output and subdirectories",
+      "recursively remove the generated files",
+      "REMOVE ALL THE GENERATED FILES RECURSIVELY",
+      "unlink the entire tree",
+      "wipe the whole directory tree",
+    ]);
+    assertSilent("prose-recursion", [
+      // Recursion as a PROGRAMMING concept, not an operation: no
+      // destructive verb present, so the verb requirement keeps these silent
+      // (the bare-`recursive` programming-noun guard is belt-and-braces).
+      "the recursive function walks the tree",
+      "recurse through the directory tree",
+      "write a recursive descent parser",
+      "recursive fibonacci in the docs",
+      // Destructive verb but no recursion cue.
+      "remove the unused import",
+      "delete the file from the repo",
+      "clear the screen",
+      "clean up the build",
+      "refactor the auth module",
+      // Lone -r prose: the flag family owns it, not this one.
+      "rm -r old-cache",
+    ]);
+  });
+
+  test("credential-operations: credential verb + credential noun, bare pair fires", () => {
+    assertFires("credential-operations", [
+      // Battle miss A10 (regression guard lives at the wrapper level below).
+      "Rotate the production API secret in all deployments",
+      "revoke the live token",
+      "replace the API key",
+      "regenerate the database password",
+      "invalidate all credentials",
+      "expire the session token",
+      // Reversed order + noun form: the secret comes first, `rotation` is
+      // the canonical nominalization this family admits.
+      "the production secret needs rotation",
+      "ROTATE THE PRODUCTION SECRET",
+      "revoked API keys must be replaced",
+    ]);
+    assertSilent("credential-operations", [
+      // Each lacks one side of the verb+noun pair — the highest
+      // false-positive-risk family in the catalogue, so both sides are
+      // strict word shapes (see jev-core.ts).
+      "rotate the wheel icon",
+      "the key to success",
+      "replace the placeholder text",
+      "tokenize the input string",
+      "password manager autofills the field",
+      "rotate through the array indices",
+      // `reset` is deliberately NOT a credential verb: routine account
+      // prose, and admitting it would fire on every password-reset mention.
+      "reset the password",
+      // Credential noun but no credential verb.
+      "read the API key from the vault",
+      "remove the unused import",
+      "refactor the auth module",
+    ]);
+  });
+
+  test("REGRESSION: battle misses A9 and A10 now fire", () => {
+    assert.equal(destructiveHint("remove all the generated files recursively"), true);
+    assert.equal(destructiveHint("Rotate the production API secret in all deployments"), true);
+  });
+
+  test("battle benign group (B1-B10) stays silent through the full wrapper", () => {
+    for (const s of [
+      "Fix a typo in a code comment",
+      "Change button padding from 4px to 8px",
+      "Rename local variable x to userCount",
+      "Bump the package version to 2.5.1",
+      "Update the README install instructions",
+      "Fix formatting of the quarterly report",
+      "Fix the drop-down menu label styling",
+      "Update settings in ./.config/opencode.json",
+      "Add a unit test for the retry helper",
+      "Write a docstring for the public API",
+    ]) {
+      assert.equal(destructiveHint(s), false, `${JSON.stringify(s)} must stay silent`);
     }
   });
 });
