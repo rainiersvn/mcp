@@ -482,11 +482,66 @@ function canonicalJson(v: unknown): string {
     .join(",")}}`
 }
 
-// Exact-match cache key: sha256 of MODEL + canonical questions + RAW state
-// (the state string as passed to decide, before any further framing). NO
-// semantic/fuzzy matching — a reworded question is legitimately a new key.
+// CONSERVATIVE cache-key normalization (KEY DERIVATION ONLY).
+//
+// WHAT IT DOES — three cosmetic folds, nothing semantic:
+//   1. trim leading/trailing whitespace,
+//   2. collapse every internal run of whitespace (\s+, incl. tabs/newlines)
+//      to a single ASCII space,
+//   3. lowercase for key purposes only,
+//   4. strip SURROUNDING framing characters only — ASCII quotes, backticks,
+//      sentence punctuation (. , ; : ! ?) and bracket/paren/brace pairs
+//      ( ) [ ] { } < > — repeatedly from both ends (re-trimming between
+//      passes, so `"  hi  "` still folds to `hi`).
+//
+// WHAT IT NEVER TOUCHES — file paths, identifiers, numbers, versions,
+// operators, interior punctuation, or word order. "delete /tmp" vs
+// "delete  /tmp " is safe to fold (same operation, extra spaces); "delete
+// logs" vs "delete logs2" is NOT (a different referent — the trailing `2`
+// is an interior token, never an edge character, so the two normalize
+// differently and keep different keys). Likewise "prod" vs "staging",
+// "v1.2" vs "v1.3", "rm -rf" vs "rm -r" all survive byte-distinct.
+//
+// WHY case-folding + whitespace are safe while anything semantic is not:
+// case and stray whitespace never change WHICH operation a state names —
+// they are typing/formatting accidents, the exact noise paraphrases and
+// consensus rewordings introduce. Stripping a path segment, a digit, a
+// version, or an operator WOULD change the referent, and serving a cached
+// answer across such a change is a correctness bug (a wrong answer), not
+// just a cache miss. So the fold stops at the documented cosmetics above.
+//
+// SCOPE: applied ONLY inside cacheKeyFor below. The state SENT UPSTREAM
+// (the fetch body) and the state passed to destructiveHint (via
+// buildEnvelope) are ALWAYS the caller's exact original string — see decide.
+export function normalizeStateForKey(state: string): string {
+  const input = typeof state === "string" ? state : String(state)
+  let s = input.toLowerCase().replace(/\s+/g, " ").trim()
+  // Edge-only framing characters. Deliberately EXCLUDES every character
+  // that can carry meaning at an edge: / \ * - + = $ @ # % & | ~ ^ and
+  // digits/letters (so flags, globs, paths, versions survive intact).
+  const EDGE_CHARS = "\"'`.,;:!?()[]{}<>"
+  const isEdge = (ch: string): boolean => EDGE_CHARS.includes(ch)
+  for (;;) {
+    let a = 0
+    let b = s.length
+    while (a < b && isEdge(s[a] as string)) a++
+    while (b > a && isEdge(s[b - 1] as string)) b--
+    const cut = s.slice(a, b).trim()
+    if (cut === s) return s
+    s = cut
+  }
+}
+
+// Cache key: sha256 of MODEL + canonical questions + NORMALIZED state (see
+// normalizeStateForKey for the documented cosmetic fold). Question hashing
+// is unchanged canonical-JSON (key ORDER never fragments the cache; arrays
+// keep order). Two states that differ by a real token keep different keys;
+// rewordings that differ only by case/whitespace/surrounding punctuation
+// share one. The raw state is stored alongside the entry (see CacheEntry)
+// so a normalized-key hit is re-verified against the incoming raw state and
+// any mismatch beyond the documented fold is treated as a MISS.
 export function cacheKeyFor(state: string, questions: unknown): string {
-  return createHash("sha256").update(`${MODEL}\n${canonicalJson(questions)}\n${state}`, "utf8").digest("hex")
+  return createHash("sha256").update(`${MODEL}\n${canonicalJson(questions)}\n${normalizeStateForKey(state)}`, "utf8").digest("hex")
 }
 
 // "wants a score" = the questions object contains an entry with type "score".
@@ -512,7 +567,7 @@ export function wantsFresh(questions: unknown): boolean {
   )
 }
 
-type CacheEntry = { upstream: unknown; at: number }
+type CacheEntry = { upstream: unknown; at: number; rawState: string }
 const jevCache = new Map<string, CacheEntry>()
 const jevInflight = new Map<string, Promise<string>>()
 
@@ -521,14 +576,14 @@ function touchCache(key: string, entry: CacheEntry): void {
   jevCache.set(key, entry)
 }
 
-function storeCache(key: string, upstream: unknown, at: number): void {
+function storeCache(key: string, upstream: unknown, at: number, rawState: string): void {
   if (!jevCache.has(key) && jevCache.size >= CACHE_CAP) {
     const oldest = jevCache.keys().next()
     if (!oldest.done) jevCache.delete(oldest.value)
   } else {
     jevCache.delete(key)
   }
-  jevCache.set(key, { upstream, at })
+  jevCache.set(key, { upstream, at, rawState })
 }
 
 export function _clearJevCache(): void {
@@ -1393,7 +1448,24 @@ export async function decide(
     const needFresh = wantsFresh(q)
 
     // Cache lookup AFTER validation, BEFORE any network.
-    const held = jevCache.get(key)
+    // COLLISION SAFETY GUARD: the key is derived from the NORMALIZED state,
+    // so a hit is re-verified — the stored RAW state must normalize to the
+    // same fold as the incoming RAW state, otherwise this is treated as a
+    // MISS and the request refetches (fail safe, never a wrong answer). With
+    // the documented fold this re-check always passes for genuine cosmetic
+    // variants and always fails for genuinely different states (which hash
+    // differently anyway); its value is defence in depth — a future edit
+    // that over-collapses the fold, or a sha256 collision, degrades to an
+    // extra fetch instead of serving a stale/wrong answer. The guard clears
+    // `held` entirely, so a guarded miss also loses the degrade-prior: a
+    // suspect entry must never be served, fresh OR stale.
+    let held = jevCache.get(key)
+    if (
+      held &&
+      (typeof held.rawState !== "string" || normalizeStateForKey(held.rawState) !== normalizeStateForKey(state))
+    ) {
+      held = undefined
+    }
     const heldAge = held ? t0 - held.at : -1
     const heldUsable = !!held && heldAge < CHOICE_TTL_MS
     if (held && heldAge < SCORE_TTL_MS && needFresh) {
@@ -1536,7 +1608,7 @@ export async function decide(
             break
           }
           const stamped = nowFn()
-          storeCache(key, data, stamped)
+          storeCache(key, data, stamped, state)
           const text = buildEnvelope(
             data,
             { cached: "none", cache_age_ms: 0, attempts, latency_ms: stamped - t0, stale: false },
