@@ -1017,13 +1017,13 @@ describe("bounded retry + cached bearer (offline — injected fetch/time)", () =
     assert.deepEqual(await run("100"), [8000], "Retry-After: 100 is capped at 8s");
   });
 
-  test("total elapsed stays under the 30s budget; backoff bases are 300/600", async () => {
+  test("total elapsed stays under the 10s budget; backoff bases are 300/600", async () => {
     _clearJevCache();
     _clearBearerCache();
     t = 14_000_000;
     assert.equal(MAX_ATTEMPTS, 3);
-    assert.equal(FIRST_ATTEMPT_TIMEOUT_MS, 8000);
-    assert.equal(OVERALL_BUDGET_MS, 30_000);
+    assert.equal(FIRST_ATTEMPT_TIMEOUT_MS, 4000);
+    assert.equal(OVERALL_BUDGET_MS, 10_000);
     assert.equal(backoffDelayMs(1, () => 0), 300);
     assert.equal(backoffDelayMs(2, () => 0), 600);
     assert.equal(backoffDelayMs(3, () => 0), 1200);
@@ -1047,7 +1047,7 @@ describe("bounded retry + cached bearer (offline — injected fetch/time)", () =
     assert.equal(calls, 3, "503 retries up to the 3-attempt max");
     assert.deepEqual(slept, [300, 600]);
     assert.ok(r.startsWith(FALLBACK_PREFIX));
-    assert.ok(elapsed < 30_000, `wall elapsed ${elapsed}ms must stay under the 30s budget`);
+    assert.ok(elapsed < OVERALL_BUDGET_MS, `wall elapsed ${elapsed}ms must stay under the 10s budget`);
   });
 });
 

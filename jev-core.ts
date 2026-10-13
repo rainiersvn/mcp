@@ -5,7 +5,6 @@ import { join } from "node:path"
 
 export const MODEL = "jev-1.13-free"
 export const ENDPOINT = "https://opencode.ai/zen/v1/systemone"
-export const TIMEOUT_MS = 30_000
 
 // Cap on the FINAL serialized state string. Inputs exceeding this are
 // truncated deterministically with TRUNCATION_MARKER appended; the marker is
@@ -388,10 +387,10 @@ export function serializeState(state?: unknown, context?: unknown): string {
 // IN-MEMORY ONLY: one stdio process per session, high key cardinality, short
 // score TTL — an on-disk cache file adds a corruption failure mode for no
 // gain. Do NOT "improve" this into a file cache.
-// Retry: 3 attempts max inside an overall 30s wall-clock budget; first
-// attempt times out at 8s, later attempts share the remaining budget, and
+// Retry: 3 attempts max inside an overall 10s wall-clock budget; first
+// attempt times out at 4s, later attempts share the remaining budget, and
 // backoff sleeps are capped by the remaining budget too, so the worst case
-// stays under 30s. Retry ONLY 429/500/502/503/504 + network/timeout errors;
+// stays under 10s. Retry ONLY 429/500/502/503/504 + network/timeout errors;
 // NEVER 401/403/422 (bad key or client shape error — retrying is pointless
 // load). Retry-After (seconds or HTTP-date) is honoured, capped at 8s.
 // Envelope: success returns the upstream object spread at root plus a
@@ -401,8 +400,27 @@ export const CHOICE_TTL_MS = 6 * 60 * 60 * 1000 // 6h (expert choice)
 export const SCORE_TTL_MS = 60 * 1000 // 60s (scores)
 export const CACHE_CAP = 500 // LRU cap; oldest evicted on overflow
 export const MAX_ATTEMPTS = 3
-export const FIRST_ATTEMPT_TIMEOUT_MS = 8_000
-export const OVERALL_BUDGET_MS = 30_000
+export const FIRST_ATTEMPT_TIMEOUT_MS = 4_000
+// Single source of truth for the request budget: the retry loop's deadline,
+// every per-attempt fetch timeout, and every backoff sleep are ALL capped by
+// the time remaining under this budget, so the worst case stays <= ~10s.
+// This MUST stay comfortably under the MCP client timeout for this server
+// ("jev": { "timeout": 15000 } in opencode.jsonc): if the server kept working
+// past 15s the client would already have abandoned the request — the caller
+// would see a timeout error with no `_jev` envelope (losing
+// needs_second_signal, destructive_hint, and the cache metadata), and a
+// client-side retry would pile duplicated load onto a FREE-TIER endpoint
+// while the server was still retrying. Do NOT raise this past ~10s without
+// also raising the client timeout; ~5s of headroom covers transport +
+// serialization. Normal cold latency is ~1.0-1.2s, so 4s/10s is comfortable
+// for the happy path and only binds the retry/degraded path.
+export const OVERALL_BUDGET_MS = 10_000
+// Legacy alias: discoverPayload().timeout_ms is the only in-repo consumer.
+// It exists so external importers of TIMEOUT_MS keep working; it is DERIVED
+// from OVERALL_BUDGET_MS, never tuned independently — the budget above is the
+// one truth. (Anti-stale-number rule: never let the advertised timeout drift
+// from the budget the retry loop actually enforces.)
+export const TIMEOUT_MS = OVERALL_BUDGET_MS
 export const BEARER_CACHE_TTL_MS = 60 * 1000
 export const RETRY_AFTER_CAP_MS = 8_000
 export const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([429, 500, 502, 503, 504])
