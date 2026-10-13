@@ -1457,9 +1457,49 @@ export async function decide(
       }
       const deadline = t0 + OVERALL_BUDGET_MS
       let attempts = 0
-      let lastFallback = "fallback:true | error: upstream request failed"
+      const GENERIC_FALLBACK = "fallback:true | error: upstream request failed"
+      let lastFallback = GENERIC_FALLBACK
+      // Last observed failure detail, so a deadline break reports WHAT
+      // happened instead of the bare generic string (see deadline guard).
+      let lastStatus: number | null = null
+      let lastBody = ""
+      let lastRetryAfterMs = 0
+      let lastError: string | null = null
+      // 429s carry a distinguishable upstream type (the free tier returns a
+      // FreeUsageLimitError): keep the `fallback:true | ` prefix EXACTLY but
+      // make the remainder actionable — HTTP status + upstream message +
+      // retry-after seconds when the server sent one — so callers can match
+      // on the 429 and schedule their next attempt instead of treating a rate
+      // limit like a dead network.
+      const rateLimitFallback = (status: number, body: string, retryAfterMs: number): string => {
+        const msg = body.slice(0, 500)
+        if (retryAfterMs > 0) {
+          const secs = Math.ceil(retryAfterMs / 1000)
+          return `fallback:true | HTTP ${status} (rate limited, retry after ${secs}s): ${msg}`
+        }
+        return `fallback:true | HTTP ${status} (rate limited): ${msg}`
+      }
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        if (deadline - nowFn() <= 0) break
+        if (deadline - nowFn() <= 0) {
+          // DEFECT 1 (found live: free-tier 429s exhausted the budget and the
+          // caller was told the bare generic string): a deadline break must
+          // never discard the real error. Report the most specific detail
+          // observed; if nothing was ever attempted, say THAT explicitly so
+          // "never tried" is distinguishable from "tried and rate limited".
+          if (attempts === 0 && lastStatus === null && lastError === null) {
+            lastFallback = "fallback:true | budget exhausted before any attempt (no request was made)"
+          } else if (lastFallback === GENERIC_FALLBACK) {
+            if (lastStatus !== null) {
+              lastFallback =
+                lastStatus === 429
+                  ? rateLimitFallback(lastStatus, lastBody, lastRetryAfterMs)
+                  : `fallback:true | HTTP ${lastStatus}: ${lastBody.slice(0, 500)}`
+            } else if (lastError !== null) {
+              lastFallback = `fallback:true | error: ${lastError.slice(0, 300)}`
+            }
+          }
+          break
+        }
         attempts++
         const remaining = deadline - nowFn()
         const timeoutMs = attempt === 1 ? Math.min(FIRST_ATTEMPT_TIMEOUT_MS, remaining) : remaining
@@ -1473,7 +1513,12 @@ export async function decide(
           })
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e)
+          lastError = msg
           if (attempt < MAX_ATTEMPTS) {
+            // Record the exception as the best-so-far fallback: if the next
+            // loop entry hits the deadline guard, the caller still learns the
+            // real exception instead of the generic string.
+            lastFallback = `fallback:true | error: ${msg.slice(0, 300)}`
             const delay = Math.min(backoffDelayMs(attempt, rngFn), Math.max(0, deadline - nowFn()))
             log("decide.retry", { attempt, error: msg.slice(0, 120) })
             if (delay > 0) await sleepFn(delay)
@@ -1507,6 +1552,8 @@ export async function decide(
         }
         const status = res.status
         const body = await res.text().catch(() => "")
+        lastStatus = status
+        lastBody = body
         if (status === 422) {
           log("decide.fallback", { reason: `http-${status}`, state_chars: state.length })
           lastFallback = `fallback:true | HTTP 422 (client-side shape error, not an outage): ${body.slice(0, 500)}`
@@ -1528,13 +1575,45 @@ export async function decide(
         if (RETRYABLE_STATUSES.has(status) && attempt < MAX_ATTEMPTS) {
           const jitter = backoffDelayMs(attempt, rngFn)
           const retryAfter = parseRetryAfterMs(res.headers, nowFn())
-          const delay = Math.min(Math.max(jitter, retryAfter), Math.max(0, deadline - nowFn()))
+          lastRetryAfterMs = retryAfter
+          // Eagerly record the specific failure BEFORE sleeping: if the sleep
+          // consumes the budget and the next entry hits the deadline guard,
+          // the caller still learns the real status/body (DEFECT 1).
+          lastFallback =
+            status === 429
+              ? rateLimitFallback(status, body, retryAfter)
+              : `fallback:true | HTTP ${status}: ${body.slice(0, 500)}`
+          const remainingMs = Math.max(0, deadline - nowFn())
+          // DEFECT 2 (found by hitting the real free-tier rate limit during
+          // live battle testing — synthetic tests never exercised a real
+          // Retry-After on a 429): when the server's Retry-After already
+          // exceeds the REMAINING budget, the retry is futile by
+          // construction — sleeping would burn the rest of the budget only to
+          // re-enter the loop and be cut off by the deadline guard, returning
+          // the same 429 seconds later. Stop immediately (no sleep, no extra
+          // attempt) and report the 429 with its Retry-After so the caller
+          // knows when to come back. Pure-jitter backoff (no Retry-After)
+          // still retries per existing policy: only a server-directed wait
+          // longer than the time left is skipped.
+          if (retryAfter > remainingMs) {
+            log("decide.fallback", {
+              reason: `http-${status}-retry-after-exceeds-budget`,
+              state_chars: state.length,
+              retry_after_ms: retryAfter,
+              remaining_ms: remainingMs,
+            })
+            break
+          }
+          const delay = Math.min(Math.max(jitter, retryAfter), remainingMs)
           log("decide.retry", { attempt, status, delay_ms: Math.round(delay) })
           if (delay > 0) await sleepFn(delay)
           continue
         }
         log("decide.fallback", { reason: `http-${status}`, state_chars: state.length })
-        lastFallback = `fallback:true | HTTP ${status}: ${body.slice(0, 500)}`
+        lastFallback =
+          status === 429
+            ? rateLimitFallback(status, body, parseRetryAfterMs(res.headers, nowFn()))
+            : `fallback:true | HTTP ${status}: ${body.slice(0, 500)}`
         break
       }
       if (heldUsable) return degraded(attempts)
