@@ -97,27 +97,34 @@ function fail(id: number | string | null, code: number, message: string) {
 
 const STATE_PROP = {
   type: "string",
-  description: "Plain-language request summary; need state/context.",
+  description: "Request summary; need state/context.",
   minLength: 1,
 } as const
 const CONTEXT_PROP = {
   type: "object",
-  description: "Context object, any keys (e.g. files, risk_flags).",
+  description: "Context object, any keys.",
 } as const
 const QUESTIONS_PROP = {
   type: "object",
-  description: "Custom questions map; omit for default probe.",
+  description: "Custom questions map.",
+} as const
+const VARIANTS_PROP = {
+  type: "array",
+  description: "Alt phrasings; median consensus.",
+  minItems: 1,
+  maxItems: 5,
+  items: { type: "string", minLength: 1 },
 } as const
 
-const Q_SHAPE = `Each questions entry requires type ("choice"|"score"|"noul") + instructions (string) + criteria (object map or array).`
-const GOTCHA_422 = `GOTCHA: questions MUST be an object map, never an array. Array shape (e.g. [{"expert":...}]) returns HTTP 422.`
-const BRACKET = `Code Mode: tools["jev"].<tool>; see discover.`
+const Q_SHAPE = `Each entry: type("choice"|"score"|"noul")+instructions+criteria(map|array).`
+const GOTCHA_422 = `GOTCHA: questions is an object map, never an array (array->422).`
+const BRACKET = `Code: tools["jev"].<t>; see discover.`
 // Accuracy note: known-tool failures (argument-validation AND upstream /
 // execution failures) always come back as a *result* whose content[0].text
 // starts "fallback:true | " with isError:true. Only these four codes are real
 // JSON-RPC errors with no text: bad envelope -32600, unparsable line -32700,
 // unknown method -32601, unknown tool -32602.
-const FALLBACK = `Known-tool failures: fallback:true text, isError:true. -32600/-32601/-32602/-32700 are RPC errors.`
+const FALLBACK = `Failures: fallback:true text, isError:true.`
 
 // Exported for inspection/debugging (the size test measures the live
 // tools/list bytes over stdio instead of importing this module, so the
@@ -125,53 +132,53 @@ const FALLBACK = `Known-tool failures: fallback:true text, isError:true. -32600/
 export const TOOLS = [
   {
     name: "decide",
-    description: `Generic routing decision with full control. Custom questions map plus state/context. ${Q_SHAPE} ${GOTCHA_422} ${BRACKET} ${FALLBACK}`,
+    description: `Routing decision with custom questions map + state/context. ${Q_SHAPE} ${GOTCHA_422} ${BRACKET} ${FALLBACK}`,
     inputSchema: {
       type: "object",
-      properties: { state: STATE_PROP, context: CONTEXT_PROP, questions: QUESTIONS_PROP },
+      properties: { state: STATE_PROP, context: CONTEXT_PROP, questions: QUESTIONS_PROP, variants: VARIANTS_PROP },
       anyOf: [{ required: ["state"] }, { required: ["context"] }],
       additionalProperties: false,
     },
   },
   {
     name: "route_expert",
-    description: `Convenience routing: which expert (@planner/@coder/@reviewer) should handle this, and how much review is needed. Default probe. Need state and/or context. ${BRACKET} ${FALLBACK}`,
+    description: `Routing: which expert (@planner/@coder/@reviewer) + review need. Default probe. Need state/context. ${BRACKET} ${FALLBACK}`,
     inputSchema: {
       type: "object",
-      properties: { state: STATE_PROP, context: CONTEXT_PROP },
+      properties: { state: STATE_PROP, context: CONTEXT_PROP, variants: VARIANTS_PROP },
       anyOf: [{ required: ["state"] }, { required: ["context"] }],
       additionalProperties: false,
     },
   },
   {
     name: "assess_risk",
-    description: `Convenience risk probe: scores blast radius / review need only (needs_review score question). Use before risky changes. Need state and/or context. ${BRACKET} ${FALLBACK}`,
+    description: `Risk probe: blast-radius/review score only. Use before risky changes. Need state/context. ${BRACKET} ${FALLBACK}`,
     inputSchema: {
       type: "object",
-      properties: { state: STATE_PROP, context: CONTEXT_PROP },
+      properties: { state: STATE_PROP, context: CONTEXT_PROP, variants: VARIANTS_PROP },
       anyOf: [{ required: ["state"] }, { required: ["context"] }],
       additionalProperties: false,
     },
   },
   {
     name: "discover",
-    description: `Discovery entry point: call first if unsure how to use this suite. Types, fields, 422 warning, context rules, examples. ${BRACKET}`,
+    description: `Discover: call first if unsure. Types, fields, 422 warning, context rules, examples. ${BRACKET}`,
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "batch",
-    description: `Batch routing: several judgements about one task in a single round trip under different framings, not one decision. Pool of 4, max 8 requests; a bad entry fails per-entry only. See discover.`,
+    description: `Batch: several judgements about one task in one round trip under different framings, not one decision. Pool of 4, max 8; bad entries fail solo. See discover.`,
     inputSchema: {
       type: "object",
       properties: {
         requests: {
           type: "array",
-          description: "Non-empty batch of {state, context?, questions?} entries, max 8.",
+          description: "Batch of {state,context?,questions?,variants?} entries, max 8.",
           minItems: 1,
           maxItems: 8,
           items: {
             type: "object",
-            properties: { state: STATE_PROP, context: CONTEXT_PROP, questions: QUESTIONS_PROP },
+            properties: { state: STATE_PROP, context: CONTEXT_PROP, questions: QUESTIONS_PROP, variants: VARIANTS_PROP },
             anyOf: [{ required: ["state"] }, { required: ["context"] }],
             additionalProperties: false,
           },
@@ -274,19 +281,19 @@ async function handle(raw: unknown) {
           case "decide": {
             const errMsg = needState(args)
             if (errMsg) return validationFail(errMsg)
-            const text = await decideWithContext(args.state, args.context, args.questions)
+            const text = await decideWithContext(args.state, args.context, args.questions, undefined, args.variants)
             return okText(text)
           }
           case "route_expert": {
             const errMsg = needState(args)
             if (errMsg) return validationFail(errMsg)
-            const text = await routeExpert(args.state, args.context)
+            const text = await routeExpert(args.state, args.context, undefined, args.variants)
             return okText(text)
           }
           case "assess_risk": {
             const errMsg = needState(args)
             if (errMsg) return validationFail(errMsg)
-            const text = await assessRisk(args.state, args.context)
+            const text = await assessRisk(args.state, args.context, undefined, args.variants)
             return okText(text)
           }
           case "discover":
