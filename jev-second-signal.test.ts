@@ -1,7 +1,8 @@
 // jev needs_second_signal tests — Node builtin test runner, no new deps.
 //
 // Covers _jev.needs_second_signal in jev-core.ts: the single boolean callers
-// gate on, consolidating hint + low confidence + high bucket. All offline:
+// gate on, consolidating hint + high bucket (low_confidence is reported but
+// never gates alone; consensus adds the disagree arm). All offline:
 // the network is replaced by the injected `fetch` seam (deps.fetchImpl),
 // except where captured golden bodies from jev-goldens.json are fed through
 // the REAL decide() pipeline (same technique as jev-goldens.test.ts).
@@ -77,20 +78,27 @@ async function runSynthetic(state: string, body: unknown, questions?: unknown): 
 }
 
 describe("computeNeedsSecondSignal truth table (pure function)", () => {
-  test("hint-only true; low-confidence-only true; high-bucket-only true; all-false false", () => {
+  // RECALIBRATION (held-out 24-case battle test: full gate 10/10 recall @ 9/14
+  // false alarms vs hint OR high 9/10 @ 2/14): the standalone low-confidence
+  // arm is RETIRED — it fired on ordinary uncertain work where the model is
+  // merely unsure. LOW-CONFIDENCE-ONLY is now FALSE; this test pins the
+  // behavioural change. The old assertions expecting `true` here encoded a
+  // measured-bad behaviour (64% false alarms) and are replaced, not kept.
+  test("hint-only true; high-bucket-only true; LOW-CONFIDENCE-ONLY false; all-false false", () => {
     assert.equal(computeNeedsSecondSignal({ hint: true, lowConfidence: false, bucket: "low" }), true);
-    assert.equal(computeNeedsSecondSignal({ hint: false, lowConfidence: true, bucket: "low" }), true);
+    assert.equal(computeNeedsSecondSignal({ hint: false, lowConfidence: true, bucket: "low" }), false);
+    assert.equal(computeNeedsSecondSignal({ hint: false, lowConfidence: true, bucket: "medium" }), false);
     assert.equal(computeNeedsSecondSignal({ hint: false, lowConfidence: false, bucket: "high" }), true);
     assert.equal(computeNeedsSecondSignal({ hint: false, lowConfidence: false, bucket: "low" }), false);
   });
 
-  test("any combination with at least one signal is true (full 8-row table)", () => {
+  test("hint OR high gates; low confidence alone never does (full 8-row table)", () => {
     const rows: Array<[{ hint: boolean; lowConfidence: boolean; bucket: string }, boolean]> = [
       [{ hint: false, lowConfidence: false, bucket: "low" }, false],
       [{ hint: false, lowConfidence: false, bucket: "medium" }, false],
       [{ hint: false, lowConfidence: false, bucket: "high" }, true],
-      [{ hint: false, lowConfidence: true, bucket: "low" }, true],
-      [{ hint: false, lowConfidence: true, bucket: "medium" }, true],
+      [{ hint: false, lowConfidence: true, bucket: "low" }, false],
+      [{ hint: false, lowConfidence: true, bucket: "medium" }, false],
       [{ hint: false, lowConfidence: true, bucket: "high" }, true],
       [{ hint: true, lowConfidence: false, bucket: "low" }, true],
       [{ hint: true, lowConfidence: true, bucket: "high" }, true],
@@ -125,7 +133,11 @@ describe("low-confidence boundary pins isLowConfidence semantics", () => {
     );
   });
 
-  test("pipeline: synthetic confidence 0.5 -> low_confidence false; 0.1 -> true", async () => {
+  // RECALIBRATION: `low_confidence` is still REPORTED (callers see it) but no
+  // longer GATES — the 0.1-confidence case below keeps low_confidence true
+  // while the gate stays false. The old `needs_second_signal === true`
+  // assertion encoded the retired arm (held-out: 9/14 benign false alarms).
+  test("pipeline: synthetic confidence 0.5 -> low_confidence false; 0.1 -> true but gate stays false", async () => {
     const bodyFor = (conf: number) => ({
       model: "jev-1.13-free",
       answers: { needs_review: { type: "score", score: 1.0, confidence: conf, probabilities: { "1": 1 } } },
@@ -136,7 +148,7 @@ describe("low-confidence boundary pins isLowConfidence semantics", () => {
     assert.equal(edge._jev.needs_second_signal, false, "low score + confident + no hint stays quiet");
     const low = await runSynthetic("synthetic boundary state", bodyFor(0.1));
     assert.equal(low._jev.low_confidence, true);
-    assert.equal(low._jev.needs_second_signal, true, "low confidence alone trips the flag");
+    assert.equal(low._jev.needs_second_signal, false, "low confidence alone must NOT trip the gate");
   });
 });
 
