@@ -2097,6 +2097,208 @@ async function runConsensus(
 // this change revises VALUES only to fund the gate docs within budget.
 // (Recalibration: recommended_usage pins gate=hint/high/disagree — low_conf is
 // reported, never gating alone.)
+export const MCP_CLIENT_TIMEOUT_MS = 15_000
+
+export interface SelfcheckDeps {
+  fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>
+  token?: string
+  /** Test seam: custom async token resolver. Only consulted when bearer is
+   * opted in via JEV_BEARER; never called on the default no-auth path. */
+  readToken?: () => Promise<string>
+  now?: () => number
+  /** Override for JEV_SELFCHECK_LIVE: false forces the fully offline variant
+   * (zero network calls) without touching the environment. */
+  live?: boolean
+}
+
+// Live/offline switch. Default is ONLINE (one minimal probe call); the env
+// var JEV_SELFCHECK_LIVE=0 selects the fully OFFLINE variant (zero network
+// calls — the mode that works while the free tier is rate-limiting). Read at
+// CALL TIME so operators can flip it between calls; deps.live wins for tests.
+// Never throws; garbage env falls back to online-with-injected-fetch (tests)
+// or online (production).
+function selfcheckLive(deps?: SelfcheckDeps): boolean {
+  try {
+    if (deps?.live !== undefined) return deps.live === true
+    return (process.env.JEV_SELFCHECK_LIVE ?? "") !== "0"
+  } catch {
+    return true
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SELFCHECK (operator diagnosis, NOT a decision).
+//
+// WHY: diagnosing this server repeatedly cost several rounds per incident — a
+// stale MCP process looked like a code bug, a 401 looked like an expired key
+// (free tier rejects ANY Authorization header), and a real 429 was flattened
+// into a generic "upstream request failed" that hid the cause. One fast
+// command answers all three immediately.
+//
+// CONTRACT (deliberately NOT the decide contract):
+// - Diagnostic, not a decision: NO envelope, NO `_jev` block, NO scoring.
+// - NEVER the `fallback:true | ` prefix — a rate-limited / unreachable
+//   upstream is a SUCCESSFUL self-check reporting that state (ok:true), not a
+//   failed one. ok:false means selfcheck itself crashed (near-impossible;
+//   the body is fully guarded).
+// - FAST: exactly ONE probe call online (no retry, first-attempt timeout),
+//   ZERO calls offline. Compact JSON, small in context.
+// - NEVER throws: malformed/absent config degrades to report fields.
+// ---------------------------------------------------------------------------
+export async function selfcheck(deps?: SelfcheckDeps): Promise<string> {
+  try {
+    // --- auth mode (same opt-in rule as the request path) ---
+    let authMode = "no-auth (default; no Authorization header sent)"
+    let credentialRead = false
+    let credentialPresent = false
+    let token: string | null = null
+    try {
+      const optIn = isBearerOptIn()
+      authMode = optIn
+        ? "bearer opt-in (JEV_BEARER=1; Authorization header sent)"
+        : "no-auth (default; no Authorization header sent)"
+      if (deps?.token !== undefined) {
+        token = typeof deps.token === "string" && deps.token.length > 0 ? deps.token : null
+        credentialPresent = token !== null
+      } else if (deps?.readToken !== undefined) {
+        if (optIn) {
+          credentialRead = true
+          try {
+            const t = await deps.readToken()
+            token = typeof t === "string" && t.length > 0 ? t : null
+            credentialPresent = token !== null
+          } catch {
+            token = null
+          }
+        }
+      } else if (optIn) {
+        credentialRead = true
+        try {
+          token = await readBearerKey()
+          credentialPresent = true
+        } catch {
+          token = null
+          credentialPresent = false
+        }
+      }
+    } catch {
+      // keep defaults: default no-auth probe, credential not read
+    }
+
+    // --- upstream probe: ONE minimal call, or none offline ---
+    const live = selfcheckLive(deps)
+    const fetchFn = deps?.fetchImpl ?? ((url: string, init?: RequestInit) => fetch(url, init))
+    const nowFn = deps?.now ?? Date.now
+    let mode: string
+    let upstream: string
+    if (!live) {
+      mode = "offline (0 calls)"
+      upstream = "offline: probe skipped (JEV_SELFCHECK_LIVE=0); no request sent"
+    } else {
+      mode = "online (1 probe call, no retry)"
+      try {
+        const res = await fetchFn(ENDPOINT, {
+          method: "POST",
+          headers: authHeaders(token),
+          body: JSON.stringify({
+            model: MODEL,
+            state: "selfcheck probe",
+            questions: { probe: { type: "noul", instructions: "connectivity probe; no judgement needed" } },
+          }),
+          signal: AbortSignal.timeout(FIRST_ATTEMPT_TIMEOUT_MS),
+        })
+        if (res.ok) {
+          upstream = `reachable: HTTP ${res.status} (upstream answered the probe)`
+        } else {
+          const body = await res.text().catch(() => "")
+          const msg = body.slice(0, 200)
+          if (res.status === 429) {
+            const raMs = parseRetryAfterMs(res.headers, nowFn())
+            upstream =
+              raMs > 0
+                ? `RATE LIMITED: HTTP 429 (retry after ${Math.ceil(raMs / 1000)}s): ${msg}; tip: JEV_SELFCHECK_LIVE=0 skips the probe`
+                : `RATE LIMITED: HTTP 429: ${msg}; tip: JEV_SELFCHECK_LIVE=0 skips the probe`
+          } else if (res.status === 401 || res.status === 403) {
+            upstream = `CREDENTIAL REJECTED: HTTP ${res.status}: ${msg}`
+          } else {
+            upstream = `HTTP ${res.status}: ${msg}`
+          }
+        }
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e)
+        upstream = `unreachable: network error: ${m.slice(0, 200)}`
+      }
+    }
+
+    // --- catalogue health: cheap, no network ---
+    let catalogue = "unknown (catalogue check failed)"
+    try {
+      const total = DESTRUCTIVE_PATTERNS.length
+      let callable = 0
+      for (const p of DESTRUCTIVE_PATTERNS) {
+        try {
+          p.pattern.lastIndex = 0
+          void p.pattern.test("")
+          callable++
+        } catch {
+          // broken family: counted, not thrown
+        }
+      }
+      catalogue =
+        callable === total
+          ? `ok (${callable}/${total} families callable)`
+          : `DEGRADED (${callable}/${total} families callable)`
+    } catch {
+      // keep "unknown"
+    }
+
+    let nodeVer = "unknown"
+    try {
+      nodeVer = process.version
+    } catch {
+      // keep "unknown"
+    }
+
+    // The battle-suite census (recall/precision/specificity) needs the frozen
+    // fixtures in jev-battle.test.ts, so it is NOT duplicated here (a copy
+    // would drift); the report points at the one offline command that prints
+    // it. Decision-cache hit rate is likewise absent: no counters exist on
+    // the hot path by design, so entries/TTLs/cap are reported instead.
+    return JSON.stringify({
+      ok: true,
+      mode,
+      upstream,
+      auth_mode: authMode,
+      credential_read: credentialRead,
+      credential_present: credentialPresent,
+      budget_ms: OVERALL_BUDGET_MS,
+      first_attempt_ms: FIRST_ATTEMPT_TIMEOUT_MS,
+      max_attempts: MAX_ATTEMPTS,
+      client_timeout_ms: MCP_CLIENT_TIMEOUT_MS,
+      budget_headroom_ms: MCP_CLIENT_TIMEOUT_MS - OVERALL_BUDGET_MS,
+      cache_entries: _jevCacheSize(),
+      choice_ttl_ms: CHOICE_TTL_MS,
+      score_ttl_ms: SCORE_TTL_MS,
+      cache_cap: CACHE_CAP,
+      bearer_cache: { file_reads: _bearerStats.fileReads, rereads: _bearerStats.rereads, hits: _bearerStats.cacheHits },
+      destructive_families: DESTRUCTIVE_PATTERNS.length,
+      catalogue,
+      battle_suite: "20 dangerous + 24 safe; census offline: node --test jev-battle.test.ts",
+      model: MODEL,
+      endpoint: ENDPOINT,
+      version: "2.0.0",
+      node: nodeVer,
+    })
+  } catch (e) {
+    try {
+      const m = e instanceof Error ? e.message : String(e)
+      return JSON.stringify({ ok: false, error: m.slice(0, 200) })
+    } catch {
+      return `{"ok":false}`
+    }
+  }
+}
+
 export function discoverPayload() {
   return {
     model: MODEL,

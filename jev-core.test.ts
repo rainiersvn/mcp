@@ -481,9 +481,17 @@ describe("injected metadata budgets (tools/list + discover)", () => {
     // requests/items schema reuses the shared prop descriptions; measured
     // 3456 after the change, so the bound moves 2600 -> 3500. Same pressure:
     // any new prose or schema still has to fit in ~44 chars of headroom.
+    // NOTE (jev selfcheck change): the selfcheck tool adds a sixth entry, but
+    // a deliberately TIGHT one — no-arg schema (properties:{}, the smallest
+    // legal inputSchema) and a ~150-char description (the <=200 target is
+    // pinned by its own test in jev-selfcheck.test.ts). Measured 3590 after
+    // the change, so the bound moves 3500 -> 3650. Same pressure as before:
+    // ~60 chars of headroom still trips on any JSON-example-scale re-bloat
+    // (+130 or more). Existing tool descriptions are byte-unchanged; only the
+    // number moves, and only by the cost of the new entry.
     const tools = await fetchToolsList();
     const len = JSON.stringify({ tools }).length;
-    assert.ok(len <= 3500, `tools/list is ${len} chars (budget 3500)`);
+    assert.ok(len <= 3650, `tools/list is ${len} chars (budget 3650)`);
   });
 
   test("tools/list schemas require state-or-context and forbid extra args", async () => {

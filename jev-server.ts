@@ -1,4 +1,4 @@
-import { assessRisk, decideBatch, decideWithContext, discoverPayload, log, routeExpert, usableContextEntries } from "./jev-core.ts"
+import { assessRisk, decideBatch, decideWithContext, discoverPayload, log, routeExpert, selfcheck, usableContextEntries } from "./jev-core.ts"
 
 type RpcMsg = { jsonrpc: "2.0"; id?: number | string | null; method?: string; params?: any }
 
@@ -166,6 +166,11 @@ export const TOOLS = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
+    name: "selfcheck",
+    description: `Selfcheck: fast operator diagnosis (reachability, auth, budget, cache, catalogue). No args. JEV_SELFCHECK_LIVE=0 skips the probe call (fully offline).`,
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
     name: "batch",
     description: `Batch: several judgements about one task in one round trip under different framings, not one decision. Pool of 4, max 8; bad entries fail solo. See discover.`,
     inputSchema: {
@@ -299,6 +304,13 @@ async function handle(raw: unknown) {
           case "discover":
             return ok({
               content: [{ type: "text", text: JSON.stringify(discoverPayload()) }],
+            })
+          case "selfcheck":
+            // Diagnostic, not a decision: raw report text, never the
+            // `fallback:true | ` contract (a rate-limited upstream is a
+            // successful self-check reporting that state, not a failure).
+            return ok({
+              content: [{ type: "text", text: await selfcheck() }],
             })
           case "batch": {
             // decideBatch never throws and never fails the batch on a bad

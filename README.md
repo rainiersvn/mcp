@@ -1,3 +1,5 @@
+> **Something wrong? Start here:** call the `selfcheck` tool — one fast check of upstream reachability, auth mode, budget, cache, and catalogue health. Set `JEV_SELFCHECK_LIVE=0` for the fully offline variant (zero network calls; the mode to use while rate-limited).
+
 # jev — decision-model MCP server
 
 An MCP **stdio** server (`jev-server.ts`) wrapping the hosted decision model
@@ -12,6 +14,7 @@ plus a local safety envelope. Node builtins only, no new deps.
 | `assess_risk` | Same envelope, review-score question only | **Before risky changes** — blast-radius check |
 | `batch` | `{results, summary:{total,ok,fallback,cached}}` — one string per entry | Several framings of one task in one round trip (pool 4, max 8; bad entries fail solo) |
 | `discover` | Self-describing payload (types, fields, 422 warning, usage) | **First, when unsure** how to call the suite |
+| `selfcheck` | Compact diagnostic JSON (reachability, auth, budget, cache, catalogue) — never `fallback:true` | **First, when something looks wrong** (stale process? 401 vs 429?); `JEV_SELFCHECK_LIVE=0` = fully offline |
 
 ## Quick start
 
@@ -34,6 +37,13 @@ given one). Opt in only if you have a key:
 JEV_BEARER=1   # 1/true/yes/on (case-insensitive) → key read from ~/.local/share/opencode/auth.json
 JEV_LIVE=1     # enable the network-dependent test blocks (skipped by default)
 JEV_LOG=debug  # stderr diagnostics: debug|info|warn|error (default warn)
+JEV_SELFCHECK_LIVE=0  # selfcheck makes ZERO network calls (fully offline report:
+                      # auth mode, budget, cache, catalogue + battle pointer).
+                      # Default (unset/≠0): selfcheck makes ONE minimal probe call
+                      # (no retry) and classifies the result as reachable,
+                      # RATE LIMITED (429), CREDENTIAL REJECTED (401/403), or
+                      # unreachable (network error). A rate limit is a successful
+                      # self-check reporting that state — not a failure.
 ```
 
 MCP config (`opencode.jsonc`) — this is the live block:
