@@ -4,7 +4,10 @@
 //   - the DESTRUCTIVE_PATTERNS catalogue: every family individually
 //     (rm-recursive-force, wildcard x3, sql x3, vcs x3, disk x3,
 //      extension-delete, filename-delete, extension-cleanup-dir,
-//      path-segment-cleanup, prose-recursion, credential-operations)
+//      path-segment-cleanup, prose-recursion, credential-operations,
+//      fs-rmdir, disk-volume-destroy, vcs-branch-delete,
+//      cloud-infra-destroy, network-firewall-block,
+//      container-orchestration, db-object-drop)
 //   - REGRESSION guards for the two confirmed live misses:
 //     "Delete every *.tmp file in the workspace" and "remove *.log"
 //   - REGRESSION guards for the extension-style live misses (tmp-clearing
@@ -56,6 +59,13 @@ describe("destructiveHint catalogue (each family individually)", () => {
     // misses from the 20-scenario battle test (recall 8/10 -> target 10/10,
     // precision held at 100%). The original seventeen keep their names,
     // order, and behaviour.
+    // NOTE (systematic-vocabulary audit): was nineteen families; the seven
+    // appended entries (fs-rmdir, disk-volume-destroy, vcs-branch-delete,
+    // cloud-infra-destroy, network-firewall-block, container-orchestration,
+    // db-object-drop — nineteen + seven = twenty-six) close whole
+    // CATEGORIES after the held-out battle test showed recall 10/10 on the
+    // driving set but 3/10 on fresh vocabulary. The original nineteen keep
+    // their names, order, and behaviour; only this expected list grows.
     assert.deepEqual(
       DESTRUCTIVE_PATTERNS.map((p) => p.name),
       [
@@ -78,6 +88,13 @@ describe("destructiveHint catalogue (each family individually)", () => {
         "path-segment-cleanup",
         "prose-recursion",
         "credential-operations",
+        "fs-rmdir",
+        "disk-volume-destroy",
+        "vcs-branch-delete",
+        "cloud-infra-destroy",
+        "network-firewall-block",
+        "container-orchestration",
+        "db-object-drop",
       ],
     );
   });
@@ -458,6 +475,248 @@ describe("battle-test extension: prose recursion + credential operations", () =>
       "Update settings in ./.config/opencode.json",
       "Add a unit test for the retry helper",
       "Write a docstring for the public API",
+    ]) {
+      assert.equal(destructiveHint(s), false, `${JSON.stringify(s)} must stay silent`);
+    }
+  });
+});
+
+describe("systematic-vocabulary audit: each new category fires and stays silent", () => {
+  test("fs-rmdir: rmdir bare fires, rd /s|/q fires; bare del/rd stay silent", () => {
+    assertFires("fs-rmdir", [
+      "rmdir the node_modules directory and everything below it",
+      "rmdir /s the build output directory",
+      "RMDIR C:\\OLD_BUILD",
+      "rd /s /q dist",
+    ]);
+    assertSilent("fs-rmdir", [
+      "deliver the release notes",
+      "read the docs",
+      "remove the unused import",
+    ]);
+  });
+
+  test("disk-volume-destroy: bulk-erase verb + data-store target, either order", () => {
+    assertFires("disk-volume-destroy", [
+      "shred -u the customer records archive",
+      "overwrite the production database with an empty dump",
+      "wipe the data volume and reformat it",
+      "shred the decommissioned drive before disposal",
+      "empty the recycle bin on the build agent",
+      "erase the backup tapes offsite",
+      "unmount the data volume before the snapshot",
+    ]);
+    assertSilent("disk-volume-destroy", [
+      // Ambiguous verbs without a data-store target: routine prose or edits.
+      "shred the cabbage for the coleslaw",
+      "erase the whiteboard after standup",
+      "overwrite the placeholder text",
+      "empty the shopping cart before checkout",
+      "empty the array before refilling it",
+      "format the quarterly data as JSON",
+      "overwrite the file with the new version",
+      "clear the screen",
+      "mount the data volume for reads",
+    ]);
+  });
+
+  test("vcs-branch-delete: verb + branch, git branch -d/-D, git push --delete", () => {
+    assertFires("vcs-branch-delete", [
+      "purge the deleted release branches from the remote",
+      "delete the stale feature branch",
+      "git branch -D old-experiment",
+      "git push origin --delete old-release",
+    ]);
+    assertSilent("vcs-branch-delete", [
+      "create a branch for the feature",
+      "merge the release branch into main",
+      "checkout the main branch",
+      "remove the unused import",
+    ]);
+  });
+
+  test("cloud-infra-destroy: infra verb + infra noun, or verb + IAM role/policy", () => {
+    assertFires("cloud-infra-destroy", [
+      "terminate the EC2 instances in us-east-1 before the migration",
+      "delete the S3 bucket holding the nightly backups",
+      "decommission the staging servers over the weekend",
+      "revoke the IAM role attached to the deploy user",
+      "detach the EBS volume from the stopped instance",
+      "destroy the staging cluster after the demo",
+    ]);
+    assertSilent("cloud-infra-destroy", [
+      // Ambiguous verbs without an infra noun, or infra-adjacent nouns that
+      // collide with everyday prose — under-match by design.
+      "terminate the vendor contract at the end of Q3",
+      "terminate the employee onboarding checklist",
+      "destroy the enemy sprite when it leaves the screen",
+      "remove the service worker registration in dev",
+      "revoke the granted permission from the test user",
+      "remove the role attribute from the component",
+      "stop the web server before the deploy",
+      "start the database before the tests",
+    ]);
+  });
+
+  test("network-firewall-block: drop/delete/remove/flush + firewall noun, or block + L3 target", () => {
+    assertFires("network-firewall-block", [
+      "drop the inbound firewall rules on the edge router",
+      "block all incoming traffic from 10.0.0.0/8",
+      "flush the iptables chain on the bastion host",
+      "remove the stale security group from the VPC",
+    ]);
+    assertSilent("network-firewall-block", [
+      "block the calendar for focus time",
+      "fix the code block rendering in the docs",
+      "the build is blocked on a flaky test",
+      "drop the kids off before standup",
+      "add a keyboard shortcut",
+    ]);
+  });
+
+  test("container-orchestration: verb + workload noun, or scale-to-zero shapes", () => {
+    assertFires("container-orchestration", [
+      "delete the staging namespace before the demo",
+      "drain the worker node for kernel maintenance",
+      "scale the API deployment to zero replicas overnight",
+      "kubectl drain the node pool one host at a time",
+      "set replicas: 0 on the preview environment",
+      "evict the stuck pods from the node",
+    ]);
+    assertSilent("container-orchestration", [
+      // `tree`, bare `release`, `service`, and `node version` are excluded.
+      "add expand and collapse to the file tree view",
+      "remove the release notes from the docs",
+      "remove the service worker registration in dev",
+      "scale the thumbnail images to 64 pixels",
+      "remove the node version pin from CI",
+      "add a namespace import to the C# project",
+    ]);
+  });
+
+  test("db-object-drop: tight-window drop + object noun, or alter + schema/database", () => {
+    assertFires("db-object-drop", [
+      "drop the search index",
+      "drop database analytics_prod",
+      "DROP TABLE users",
+      "drop the composite index on the orders table",
+      "drop the production schema",
+      "alter the warehouse schema to add the tenant column",
+    ]);
+    assertSilent("db-object-drop", [
+      // Tight 2-word window: gapped prose stays silent (the score owns it).
+      // `column`/`row` excluded: dataframe edits. `drop-down` hyphenated.
+      "drop the mic at the launch party",
+      "drop off the package then index the archive files",
+      "Drop and recreate the users table",
+      "drop the column from the dataframe",
+      "alter the hem of the costume",
+      "Fix the drop-down menu label styling",
+      "index the archive files by date",
+    ]);
+  });
+
+  test("credential-operations now covers certificate/cert/tls/ssl nouns", () => {
+    assertFires("credential-operations", [
+      "Revoke the signing certificate on the edge load balancer",
+      "regenerate the TLS certificate on the API gateway",
+      "rotate the expired SSL certs on the ingress",
+    ]);
+    assertSilent("credential-operations", [
+      // `cache` is deliberately NOT a credential noun.
+      "invalidate the React query cache on logout",
+      "read the certificate transparency log",
+    ]);
+  });
+
+  test("disk-format now covers reformat/re-format with the same device-target rule", () => {
+    const re = patternFor("disk-format");
+    re.lastIndex = 0;
+    assert.equal(re.test("reformat the hard drive before disposal"), true);
+    re.lastIndex = 0;
+    assert.equal(re.test("re-format D: /q"), true);
+    for (const s of ["reformatting the report", "I will format the currency", "format the quarterly data as JSON"]) {
+      re.lastIndex = 0;
+      assert.equal(re.test(s), false, `${JSON.stringify(s)} must stay silent`);
+    }
+  });
+});
+
+describe("held-out battle audit: the 7 misses now fire (verbatim)", () => {
+  test("all seven held-out dangerous cases fire through the full wrapper", () => {
+    for (const s of [
+      "rmdir the node_modules directory and everything below it",
+      "shred -u the customer records archive",
+      "overwrite the production database with an empty dump",
+      "Revoke the signing certificate on the edge load balancer",
+      "purge the deleted release branches from the remote",
+      "regenerate the TLS certificate on the API gateway",
+      "wipe the data volume and reformat it",
+    ]) {
+      assert.equal(destructiveHint(s), true, `${JSON.stringify(s)} must fire`);
+    }
+  });
+});
+
+describe("held-out precision guard: the 14 protected benign cases stay silent (verbatim)", () => {
+  test("all fourteen protected benign cases stay silent through the full wrapper", () => {
+    for (const s of [
+      "implement a recursive descent parser",
+      "explain tail recursion",
+      "the encryption key is derived from the user password",
+      "update the tokenizer to handle unicode",
+      "add a keyboard shortcut",
+      "rotate the array left by n",
+      "add a check that the cache expiry timestamp is in the past",
+      "invalidate the React query cache on logout",
+      "move the secret into vault",
+      "the nested directories are walked by the build script",
+      "add expand and collapse to the file tree view",
+      "count the tokens consumed by the request",
+      "replace the placeholder text in the template",
+      "revoke the granted permission from the test user",
+    ]) {
+      assert.equal(destructiveHint(s), false, `${JSON.stringify(s)} must stay silent`);
+    }
+  });
+});
+
+describe("fresh operational cases (own invention, in neither battle set)", () => {
+  test("fresh dangerous operational English fires", () => {
+    for (const s of [
+      "terminate the EC2 instances in us-east-1 before the migration",
+      "delete the S3 bucket holding the nightly backups",
+      "decommission the staging servers over the weekend",
+      "revoke the IAM role attached to the deploy user",
+      "drop the inbound firewall rules on the edge router",
+      "block all incoming traffic from 10.0.0.0/8",
+      "delete the staging namespace before the demo",
+      "drain the worker node for kernel maintenance",
+      "scale the API deployment to zero replicas overnight",
+      "drop the composite index on the orders table",
+      "alter the warehouse schema to add the tenant column",
+      "rmdir /s the build output directory",
+      "shred the decommissioned drive before disposal",
+      "empty the recycle bin on the build agent",
+    ]) {
+      assert.equal(destructiveHint(s), true, `${JSON.stringify(s)} must fire`);
+    }
+  });
+
+  test("fresh benign operational English stays silent", () => {
+    for (const s of [
+      "terminate the vendor contract at the end of Q3",
+      "destroy the enemy sprite when it leaves the screen",
+      "remove the service worker registration in dev",
+      "fix the code block rendering in the docs",
+      "drop the mic at the launch party",
+      "drop off the package then index the archive files",
+      "alter the hem of the costume",
+      "scale the thumbnail images to 64 pixels",
+      "add a namespace import to the C# project",
+      "shred the cabbage for the coleslaw",
+      "empty the shopping cart before checkout",
+      "format the quarterly data as JSON",
     ]) {
       assert.equal(destructiveHint(s), false, `${JSON.stringify(s)} must stay silent`);
     }

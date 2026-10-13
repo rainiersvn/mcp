@@ -851,6 +851,19 @@ export function isLowConfidence(answers: unknown): boolean {
 //   Nominalizations stay verb-only except `rotation` ("secret rotation" is
 //   the canonical noun phrasing); other -ion/-ment forms stay silent
 //   pending evidence.
+// - SYSTEMATIC VOCABULARY AUDIT (held-out recall was 10/10 on the driving
+//   set but 3/10 on fresh vocabulary — the catalogue generalised worse than
+//   its own tests claimed, which is why the six families below enumerate verb
+//   families per CATEGORY instead of chasing individual misses). Ambiguous
+//   words prefer silence (see the fragment comments for the full per-word
+//   rationale): `terminate`/`destroy` need an infra noun; `stop`/`start`
+//   excluded (reversible); `service` excluded (service-worker collision);
+//   bare `role`/`policy` need an `IAM` qualifier; `block` needs an L3 target;
+//   `erase`/`overwrite`/`shred`/`empty` need a data-store target while bare
+//   `data`/`file` never fire; `drop` allows at most 2 words before the object
+//   noun and never matches `column`/`row`; `alter` pairs only with
+//   schema/database; `tree` and bare `release` excluded from container nouns;
+//   `del`/bare-`rd` excluded while `rmdir` fires bare (never prose).
 // Case-insensitive throughout; `\s+` tolerates any spacing; nothing is `^`
 // anchored so an imperative verb fires mid-sentence as well as at the start.
 // ---------------------------------------------------------------------------
@@ -909,9 +922,77 @@ const PROSE_RECURSION_CUE = String.raw`(?:\brecursively\b|\brecursive\b(?!\s+(?:
 // would fire the hint on every password-reset mention.
 const CREDENTIAL_VERB = String.raw`\b(?:rotat(?:e|ed|es|ing|ion)|revok(?:e|ed|es|ing)|replac(?:e|ed|es|ing)|regenerat(?:e|ed|es|ing)|invalidat(?:e|ed|es|ing)|expir(?:e|ed|es|ing))\b`
 // Credential noun: api-key (glued/spaced/hyphenated) / secret / token /
-// password / credential / bare key, singular or plural. Word boundaries both
-// sides: "tokenize" (lexer sense), "keyboard", and "monkey" never match.
-const CREDENTIAL_NOUN = String.raw`(?:\bapi[\s-_]*keys?\b|\bsecrets?\b|\btokens?\b|\bpasswords?\b|\bcredentials?\b|\bkeys?\b)`
+// password / credential / bare key / certificate / cert / tls / ssl,
+// singular or plural. Word boundaries both sides: "tokenize" (lexer sense),
+// "keyboard", and "monkey" never match. `certificate`/`cert`/`tls`/`ssl`
+// joined in the systematic-vocabulary audit (below): revoking or regenerating
+// a signing/TLS certificate is a credential operation. `cache` is
+// deliberately NOT here: "invalidate the React query cache" is routine
+// app-cache prose, and admitting it would fire the hint on every logout.
+const CREDENTIAL_NOUN = String.raw`(?:\bapi[\s-_]*keys?\b|\bsecrets?\b|\btokens?\b|\bpasswords?\b|\bcredentials?\b|\bkeys?\b|\bcertificates?\b|\bcerts?\b|\btls\b|\bssl\b)`
+// Systematic-vocabulary audit (held-out: recall was 10/10 on the driving set
+// but 3/10 on fresh vocabulary — the catalogue generalised worse than its own
+// tests claimed). The fragments below enumerate verb families per CATEGORY
+// (filesystem bulk, disk/volume, VCS branches, cloud/infra, network,
+// container, db objects) instead of chasing individual misses. See the
+// FALSE-POSITIVE TRADE-OFF block for the per-word under-match judgements.
+// Bulk-erase verb: wipe/erase/shred/overwrite/re-format/unmount/empty, base +
+// ed/es/ing (+en for overwrite, +ied/ies/ying for empty). NEVER fires alone:
+// each needs a data-store target (next entry), so "erase the whiteboard",
+// "overwrite the placeholder", "shred the cabbage", "empty the cart",
+// "format the data as JSON" (bare `data` excluded), and "overwrite the file"
+// (bare `file` excluded as a routine edit) all stay silent.
+const BULK_ERASE_VERB = String.raw`\b(?:wip(?:e|ed|es|ing)|eras(?:e|ed|es|ing)|shred(?:ded|ding|s)?|overwrit(?:e|es|ing|ten)|(?:re-?)?format(?:ted|ting|s)?|unmount(?:ed|ing|s)?|empt(?:y|ied|ies|ying))\b`
+// Data-store target: volumes/disks/partitions/filesystems/mounts, databases/
+// backups/dumps/archives/records/logs/tables/buckets/queues, trash/recycle,
+// firmware/boot records. Bare `data` and bare `file` are DELIBERATELY absent
+// (see above); device paths (`C:`, `/dev/...`) included.
+const BULK_ERASE_TARGET = String.raw`(?:\b(?:volumes?|disks?|drives?|partitions?|filesystems?|mounts?|devices?|ssds?|hdds?|databases?|backups?|dumps?|archives?|records?|logs?|tables?|buckets?|queues?|trash|recycle(?:\s+bin)?|bins?|firmware|boot(?:\s+records?)?|mbr)\b|(?:[a-z]:|\/dev\/\S*))`
+// VCS branch-deletion verb: delete/remove/purge only, base + ed/es/ing.
+// `clear` is excluded (too benign); create/merge/checkout never appear here,
+// so "create a branch" stays silent for lack of a destructive verb.
+const VCS_BRANCH_VERB = String.raw`\b(?:delet(?:e|ed|es|ing)|remov(?:e|ed|es|ing)|purg(?:e|ed|es|ing))\b`
+// Cloud/infra verb: terminate/destroy/deprovision/decommission/teardown/
+// detach/unmount/delete/remove/purge/revoke, base + ed/es/ing (+ion/+ment
+// nominalizations where attested). `stop`/`start` are DELIBERATELY absent:
+// stopping an instance is reversible, and a hint on every "stop the server"
+// trains callers to ignore it.
+const CLOUD_VERB = String.raw`\b(?:terminat(?:e|ed|es|ing|ion)|destroy(?:ed|ing|s)?|deprovision(?:ed|ing|s)?|decommission(?:ed|ing|s)?|teardown|detach(?:ed|ing|es|ment)?|unmount(?:ed|ing|s)?|delet(?:e|ed|es|ing)|remov(?:e|ed|es|ing)|purg(?:e|ed|es|ing)|revok(?:e|ed|es|ing))\b`
+// Cloud/infra noun: instance/vm/ec2/cluster/bucket/s3/volume/snapshot/stack/
+// droplet/server/host/vpc/subnet/ami/datacenter. `service` is DELIBERATELY
+// absent (service-worker collision: "remove the service worker" stays
+// silent); bare `role`/`policy` are absent too (see IAM_ROLE_PHRASE).
+const CLOUD_NOUN = String.raw`(?:\binstances?\b|\bvms?\b|\bec2\b|\bclusters?\b|\bbuckets?\b|\bs3\b|\bvolumes?\b|\bsnapshots?\b|\bstacks?\b|\bdroplets?\b|\bservers?\b|\bhosts?\b|\bvpcs?\b|\bsubnets?\b|\bamis?\b|\bdatacenters?\b|\bdata\s+centers?\b)`
+// IAM role/policy verb (revoke/detach/delete/remove) + an IAM-QUALIFIED
+// role/policy phrase ("IAM role", "IAM policy", "policy ... IAM"). The `iam`
+// qualifier is what separates "revoke the IAM role" from "remove the role
+// attribute" and "revoke the granted permission" — both stay silent.
+const CLOUD_IAM_VERB = String.raw`\b(?:revok(?:e|ed|es|ing)|detach(?:ed|ing|es|ment)?|delet(?:e|ed|es|ing)|remov(?:e|ed|es|ing))\b`
+const IAM_ROLE_PHRASE = String.raw`(?:\biam[\s-]+(?:roles?|polic(?:y|ies))\b|\b(?:roles?|polic(?:y|ies))[\s-]+iam\b)`
+// Network drop verb: drop(ped/ping/s)/delete/remove/flush, base + ed/es/ing.
+// `block` is NOT here (it needs its own L3 target, next entries): "block the
+// calendar" and bare "code block" stay silent, as does "drop the kids off"
+// (no firewall noun) — while drop+index is owned by db-object-drop, not here.
+const NET_DROP_VERB = String.raw`\b(?:drop(?:ped|ping|s)?|delet(?:e|ed|es|ing)|remov(?:e|ed|es|ing)|flush(?:ed|ing|es)?)\b`
+const NET_NOUN = String.raw`\b(?:firewalls?|iptables|security[\s-]+groups?|acls?|network[\s-]+polic(?:y|ies)|route[\s-]+tables?)\b`
+const BLOCK_VERB = String.raw`\bblock(?:ed|ing|s)?\b`
+const BLOCK_TARGET = String.raw`\b(?:ips?|cidrs?|subnets?|traffic|ports?|ingress|egress|packets?|connections?|addresses?)\b`
+// Container verb: delete/remove/drain/evict/purge, base + ed/es/ing.
+// `collapse` is DELIBERATELY absent (file-tree UI prose: "expand and collapse
+// to the file tree view" stays silent).
+const CONT_VERB = String.raw`\b(?:delet(?:e|ed|es|ing)|remov(?:e|ed|es|ing)|drain(?:ed|ing|s)?|evict(?:ed|ing|s)?|purg(?:e|ed|es|ing))\b`
+// Workload noun: namespace/pod/deployment/daemonset/statefulset/replicaset/
+// node/pvc/helm-release/cluster. `tree` is DELIBERATELY absent (file-tree UI
+// prose); bare `release` is absent (docs prose: "remove the release notes"
+// stays silent — only `helm release` fires); `node` ignores `node version`
+// pins ("remove the node version pin" stays silent). `node_modules` never
+// matches: `_` is a word char, so `\bnodes?\b` fails before `_`.
+const CONT_NOUN = String.raw`(?:\bnodes?\b(?!\s+versions?\b)|\b(?:namespaces?|pods?|deployments?|daemonsets?|statefulsets?|replicasets?|pvcs?|persistentvolumeclaims?|helm[\s-]+releases?|clusters?)\b)`
+// DB object noun for the tight-window `drop` (below): index/indices/schema/
+// partition/view/sequence/collection (+table/database, overlapping sql-drop
+// for gapped phrasing). `column`/`row` are DELIBERATELY absent: "drop the
+// column" is a routine dataframe edit, and a hint there cries wolf.
+const DB_OBJECT_NOUN = String.raw`(?:index(?:es)?|indices|schemas?|partitions?|views?|sequences?|collections?|tables?|databases?)\b`
 
 export interface DestructivePattern {
   // Stable family id — tests cover each family individually through this list.
@@ -991,9 +1072,9 @@ export const DESTRUCTIVE_PATTERNS: DestructivePattern[] = [
   },
   {
     name: "disk-format",
-    why: "`format` only with a device-ish target; 'format the currency' stays silent.",
+    why: "`(re-)format` only with a device-ish target; 'format the currency' and 'format the data as JSON' stay silent.",
     pattern:
-      /\bformat\b\s+(?:the\s+|a\s+|an\s+)?(?:[a-z]:|\/dev\/\S*|disks?|drives?|partitions?|volumes?|hard(?:\s+disks?|\s+drives?)?|sd(?:\s+cards?)?|usb(?:\s+(?:drives?|sticks?|keys?))?|ssds?|hdds?)(?![\w])/i,
+      /\b(?:re-?)?format\b\s+(?:the\s+|a\s+|an\s+)?(?:[a-z]:|\/dev\/\S*|disks?|drives?|partitions?|volumes?|hard(?:\s+disks?|\s+drives?)?|sd(?:\s+cards?)?|usb(?:\s+(?:drives?|sticks?|keys?))?|ssds?|hdds?)(?![\w])/i,
   },
   {
     name: "extension-delete",
@@ -1037,9 +1118,62 @@ export const DESTRUCTIVE_PATTERNS: DestructivePattern[] = [
   },
   {
     name: "credential-operations",
-    why: "credential verb + credential noun within 80 chars either order ('rotate the production API secret', 'revoke the token'); 'rotate the wheel', 'key to success', 'tokenize', 'password manager' stay silent (each lacks one side of the pair).",
+    why: "credential verb + credential noun within 80 chars either order ('rotate the production API secret', 'revoke the token', 'revoke the signing certificate', 'regenerate the TLS certificate'); 'rotate the wheel', 'key to success', 'tokenize', 'password manager', 'invalidate the query cache' stay silent (each lacks one side of the pair — cache is not a credential noun).",
     pattern: new RegExp(
       `(?:${CREDENTIAL_VERB}[\\s\\S]{0,80}?${CREDENTIAL_NOUN}|${CREDENTIAL_NOUN}[\\s\\S]{0,80}?${CREDENTIAL_VERB})`,
+      "i",
+    ),
+  },
+  {
+    name: "fs-rmdir",
+    why: "`rmdir` (any target) and `rd /s|/q` never appear in benign prose (like `rm`/`mkfs`), so bare fires ('rmdir the node_modules directory'); bare `del`/`rd` excluded (`del` is a word-fragment risk, bare `rd` collides with abbreviations).",
+    pattern: /\brmdir\b|\brd\s+\/(?:s|q)\b/i,
+  },
+  {
+    name: "disk-volume-destroy",
+    why: "bulk-erase verb (wipe/erase/shred/overwrite/re-format/unmount/empty) + data-store target within 80 chars either order ('wipe the data volume', 'shred the records archive', 'overwrite the production database'); bare `data`/`file`, cooking (`shred the cabbage`), shopping (`empty the cart`), and `format the data as JSON` stay silent.",
+    pattern: new RegExp(
+      `(?:${BULK_ERASE_VERB}[\\s\\S]{0,80}?${BULK_ERASE_TARGET}|${BULK_ERASE_TARGET}[\\s\\S]{0,80}?${BULK_ERASE_VERB})`,
+      "i",
+    ),
+  },
+  {
+    name: "vcs-branch-delete",
+    why: "destructive verb + `branch(es)` within 80 chars either order, or `git branch -d|-D|--delete` / `git push --delete` nearby ('purge the deleted release branches from the remote'); create/merge/checkout + branch stay silent (no destructive verb).",
+    pattern: new RegExp(
+      `(?:${VCS_BRANCH_VERB}[\\s\\S]{0,80}?\\bbranch(?:es)?\\b|\\bbranch(?:es)?\\b[\\s\\S]{0,80}?${VCS_BRANCH_VERB}|\\bgit\\s+branch\\b(?=[\\s\\S]{0,40}?(?:\\s-[dD]\\b|\\s--delete\\b))|\\bgit\\s+push\\b(?=[\\s\\S]{0,80}?\\s--delete\\b))`,
+      "i",
+    ),
+  },
+  {
+    name: "cloud-infra-destroy",
+    why: "infra verb (terminate/destroy/deprovision/decommission/teardown/detach/unmount/delete/remove/purge/revoke) + infra noun (instance/bucket/volume/server/...) within 80 chars either order, or verb + `IAM role|policy` ('terminate the EC2 instances', 'revoke the IAM role'); `terminate the contract`, `destroy the sprite`, `remove the service worker`, `revoke the granted permission`, `stop the instance` stay silent.",
+    pattern: new RegExp(
+      `(?:${CLOUD_VERB}[\\s\\S]{0,80}?${CLOUD_NOUN}|${CLOUD_NOUN}[\\s\\S]{0,80}?${CLOUD_VERB}|${CLOUD_IAM_VERB}[\\s\\S]{0,80}?${IAM_ROLE_PHRASE}|${IAM_ROLE_PHRASE}[\\s\\S]{0,80}?${CLOUD_IAM_VERB})`,
+      "i",
+    ),
+  },
+  {
+    name: "network-firewall-block",
+    why: "`drop|delete|remove|flush` + firewall/iptables/security-group/ACL noun, or `block` + L3 target (ip/traffic/port/cidr/...) within 80 chars either order ('drop the firewall rules', 'block all incoming traffic'); `block the calendar`, bare `code block`, `drop the kids off` stay silent.",
+    pattern: new RegExp(
+      `(?:${NET_DROP_VERB}[\\s\\S]{0,80}?${NET_NOUN}|${NET_NOUN}[\\s\\S]{0,80}?${NET_DROP_VERB}|${BLOCK_VERB}[\\s\\S]{0,80}?${BLOCK_TARGET}|${BLOCK_TARGET}[\\s\\S]{0,80}?${BLOCK_VERB})`,
+      "i",
+    ),
+  },
+  {
+    name: "container-orchestration",
+    why: "`delete|remove|drain|evict|purge` + workload noun (namespace/pod/deployment/node/...) within 80 chars either order, or `scale ... to zero` / `replicas: 0` ('delete the staging namespace', 'drain the node', 'scale the deployment to zero'); file-tree UI prose, `remove the service worker`, bare `release notes`, `scale the thumbnails`, `node version` pins stay silent.",
+    pattern: new RegExp(
+      `(?:${CONT_VERB}[\\s\\S]{0,80}?${CONT_NOUN}|${CONT_NOUN}[\\s\\S]{0,80}?${CONT_VERB}|\\bscale\\b[\\s\\S]{0,40}?\\bto\\s+zero\\b|\\bto\\s+zero\\b[\\s\\S]{0,40}?\\bscale\\b|\\breplicas?\\s*[:=]\\s*0\\b)`,
+      "i",
+    ),
+  },
+  {
+    name: "db-object-drop",
+    why: "`drop` + index/schema/partition/view/sequence/collection/table/database within 2 words ('drop the search index'), or `alter` + schema/database within 80 chars either order; `drop the mic`, gapped `drop ... then index`, dataframe `drop the column`, `alter the dress`, and `drop-down menu` stay silent.",
+    pattern: new RegExp(
+      `(?:\\bdrop\\s+(?:[A-Za-z0-9_-]+\\s+){0,2}?${DB_OBJECT_NOUN}|\\balter(?:ed|s|ing)?\\b[\\s\\S]{0,80}?\\b(?:schemas?|databases?)\\b|\\b(?:schemas?|databases?)\\b[\\s\\S]{0,80}?\\balter(?:ed|s|ing)?\\b)`,
       "i",
     ),
   },
