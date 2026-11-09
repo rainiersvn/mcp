@@ -15,11 +15,16 @@ import { fileURLToPath } from "node:url";
 import {
   CACHE_CAP,
   CHOICE_TTL_MS,
+  DEFAULT_MAX_INFLIGHT,
   DESTRUCTIVE_PATTERNS,
   FIRST_ATTEMPT_TIMEOUT_MS,
   MAX_ATTEMPTS,
   OVERALL_BUDGET_MS,
   SCORE_TTL_MS,
+  _clearInflightGate,
+  _gateStats,
+  acquireInflight,
+  releaseInflight,
   selfcheck,
 } from "./jev-core.ts";
 
@@ -195,6 +200,48 @@ describe("selfcheck never crashes on malformed/absent config", () => {
       const text = await selfcheck();
       const p = JSON.parse(text) as Record<string, unknown>;
       assert.equal(p.ok, true);
+    });
+  });
+});
+
+describe("selfcheck gate saturation (busy branch, no request made)", () => {
+  test("all slots held => busy upstream, ok:true, zero probe fetches", async () => {
+    // Worst case ~4s wait: the probe waits its turn within
+    // FIRST_ATTEMPT_TIMEOUT_MS on real timers, then reports busy instead of
+    // piling on. Every other selfcheck branch has a test; this is the
+    // gate-saturation one.
+    await withEnv({ JEV_MAX_INFLIGHT: undefined }, async () => {
+      _clearInflightGate();
+      const realSleep = async (ms: number): Promise<void> =>
+        new Promise<void>((r) => setTimeout(r, ms));
+      const farFuture = Date.now() + 60_000;
+      for (let i = 0; i < DEFAULT_MAX_INFLIGHT; i++) {
+        assert.equal(await acquireInflight(farFuture, Date.now, realSleep), true);
+      }
+      assert.equal(_gateStats().active, DEFAULT_MAX_INFLIGHT, "all gate slots must be held");
+      try {
+        let calls = 0;
+        const text = await selfcheck({
+          live: true,
+          token: "tok-test",
+          fetchImpl: async () => {
+            calls++;
+            return okJson({ answers: {} });
+          },
+        });
+        assert.equal(calls, 0, "a saturated gate must make zero probe fetches");
+        assert.ok(!text.startsWith(FALLBACK_PREFIX), "busy is a successful diagnosis, not a fallback");
+        const p = JSON.parse(text) as Record<string, unknown>;
+        assert.equal(p.ok, true);
+        assert.ok(
+          String(p.upstream).includes("busy: too many in-flight requests"),
+          `busy marker: ${p.upstream}`,
+        );
+      } finally {
+        for (let i = 0; i < DEFAULT_MAX_INFLIGHT; i++) releaseInflight();
+        _clearInflightGate();
+      }
+      assert.equal(_gateStats().active, 0, "gate must drain after the test");
     });
   });
 });

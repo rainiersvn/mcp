@@ -367,7 +367,9 @@ export function serializeState(state?: unknown, context?: unknown): string {
         const raw = vals[idx].endsWith(CONTEXT_VALUE_TRUNCATION_MARKER)
           ? vals[idx].slice(0, -CONTEXT_VALUE_TRUNCATION_MARKER.length)
           : vals[idx]
-        vals[idx] = truncateValue(raw, Math.max(0, vals[idx].length - excess))
+        // Never shrink below one full marker: a 0 cap would erase the value to
+        // "" and undershoot the cap instead of landing exactly on it.
+        vals[idx] = truncateValue(raw, Math.max(CONTEXT_VALUE_TRUNCATION_MARKER.length, vals[idx].length - excess))
         out = joinAll()
       }
     }
@@ -462,12 +464,67 @@ export interface DecideDeps {
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   rng?: () => number
+  /** Absolute wall-clock deadline in ms on the `now` clock. decide() enforces
+   * min(t0 + OVERALL_BUDGET_MS, deadline ?? +Inf); decideBatch mints one
+   * toolDeadline per call and every entry inherits it, so fan-out shares a
+   * single budget and late entries fall back instead of overrunning the MCP
+   * client timeout. runConsensus inherits it by forwarding deps. */
+  deadline?: number
+  /** @internal Per-tool-call shared upstream-request counter, threaded by
+   * decideBatch through every entry (nested calls reuse the outer object).
+   * Callers never set this; decide() reserves one unit per fetch attempt and
+   * falls back past MAX_REQUESTS_PER_CALL. */
+  __shared?: { used: number }
   /** Convenience alias: caller-supplied consensus variants carried on the deps
    * object. Equivalent to the positional `variants` argument of
    * decide/decideWithContext/routeExpert/assessRisk; the positional argument
    * wins when both are present. Validated by validateVariants (1..5
-   * non-blank strings); invalid values fall back with no network call. */
+   * non-blank strings); invalid values fall back with no network call.
+   *
+   * CONSUMABLE, STRIP BEFORE FAN-OUT (F1): an entry point reads this alias
+   * exactly ONCE to pick the consensus fan-out. It must never ride along with
+   * deps into that fan-out — stripVariants() below enforces that. */
   variants?: unknown
+}
+
+// F1 unbounded-recursion guard. `variants` is a CONSUMABLE alias: a public
+// entry point (decide/decideWithContext/routeExpert/assessRisk) reads it once
+// to choose the consensus fan-out, and it must NOT travel with deps any
+// further. decideBatch copies every deps key onto each entry, and each entry
+// re-reads `deps.variants` — so a carried alias makes every entry fan out
+// again, and again, without bound (the call never settles; it exhausts the
+// stack). Stripping at every deps->fan-out boundary keeps the alias exactly
+// ONE level deep. Returns the SAME object when there is nothing to strip, so
+// the historical no-variants path allocates nothing and stays byte-identical.
+function stripVariants(deps: DecideDeps | undefined): DecideDeps | undefined {
+  if (!deps || !("variants" in deps)) return deps
+  const { variants: _consumed, ...rest } = deps
+  return rest
+}
+
+// Single normalisation point for the calling convention shared by every
+// public entry (decide/decideWithContext/routeExpert/assessRisk): positional
+// `variants` wins, else an array in the deps slot, else the consumable
+// deps.variants alias. The returned deps are ALWAYS stripped (stripVariants
+// inside) so the alias never rides into a fan-out. This is the ONLY place
+// that inspects the deps slot shape — keep it that way (single probe).
+export interface EntryArgs {
+  deps: DecideDeps | undefined
+  variants: unknown
+}
+
+export function entryArgs(
+  deps: DecideDeps | DecideDeps[] | undefined,
+  variants: unknown,
+): EntryArgs {
+  const depsIsArray = Array.isArray(deps)
+  if (variants !== undefined) {
+    return { deps: stripVariants(depsIsArray ? undefined : (deps as DecideDeps | undefined)), variants }
+  }
+  if (depsIsArray) return { deps: undefined, variants: deps }
+  const d = deps as DecideDeps | undefined
+  if (d?.variants !== undefined) return { deps: stripVariants(d), variants: d.variants }
+  return { deps: d, variants: undefined }
 }
 
 // Canonical JSON: object keys sorted recursively, so key ORDER in the
@@ -589,10 +646,173 @@ function storeCache(key: string, upstream: unknown, at: number, rawState: string
 export function _clearJevCache(): void {
   jevCache.clear()
   jevInflight.clear()
+  _clearInflightGate()
 }
 
 export function _jevCacheSize(): number {
   return jevCache.size
+}
+
+// ---------------------------------------------------------------------------
+// PROCESS-WIDE CONCURRENCY GATE (in-flight fetch semaphore).
+//
+// WHY: decideBatch fans out (pool 4, up to 8 entries) and runConsensus fans
+// out again (up to 5 variants), so one tool call can hold many concurrent
+// fetches; nested batches multiply that further. Unbounded, that piles
+// duplicated load onto a FREE-TIER endpoint that already 429s. The gate caps
+// IN-FLIGHT fetchFn calls process-wide (DEFAULT_MAX_INFLIGHT, override via
+// JEV_MAX_INFLIGHT clamped 1..8, read at call time so tests and operators can
+// flip it between calls).
+//
+// SCOPE: held ONLY across the fetchFn promise itself (headers in flight) —
+// released the moment headers resolve, NEVER across body parsing
+// (res.json()/res.text()) or backoff sleeps. Each retry attempt acquires
+// separately. NOTE: the gate bounds request INITIATION (headers), not
+// concurrent body streams — peak open bodies can exceed the cap, harmless
+// for small JSON bodies. Waiting consumes the caller's wall-clock budget: acquire takes
+// the same absolute deadline the retry loop enforces and returns false when
+// it runs out, so the caller reports the existing budget-exhausted string
+// with zero new fetches instead of hanging past the MCP client timeout.
+// FIFO: tickets queue in arrival order and only the head may take a freed
+// slot. Every poll iteration yields to the event loop (setImmediate) so
+// event-driven fetch completions can run while waiters wait — a pure
+// microtask spin would starve the very timers/completions that free slots.
+// Node builtins only. Never throws.
+// ---------------------------------------------------------------------------
+export const DEFAULT_MAX_INFLIGHT = 4
+export const MAX_INFLIGHT_CAP = 8
+// Total upstream requests (fetchFn calls, retries included) allowed per
+// top-level tool call. decideBatch/consensus fan-out shares one counter per
+// call, so an 8-entry batch that keeps retrying degrades to per-entry
+// fallbacks instead of hammering the endpoint unboundedly.
+export const MAX_REQUESTS_PER_CALL = 12
+
+export function maxInflight(): number {
+  try {
+    const raw = process.env.JEV_MAX_INFLIGHT
+    if (raw === undefined || raw.trim() === "") return DEFAULT_MAX_INFLIGHT
+    const n = Number.parseInt(raw.trim(), 10)
+    if (!Number.isFinite(n)) return DEFAULT_MAX_INFLIGHT
+    return Math.min(MAX_INFLIGHT_CAP, Math.max(1, Math.floor(n)))
+  } catch {
+    return DEFAULT_MAX_INFLIGHT
+  }
+}
+
+let inflightActive = 0
+// F4 underflow counter: releaseInflight still clamps at 0 (never negative),
+// but an unbalanced extra release now increments this instead of passing
+// silently — visible via _gateStats(), reset by _clearInflightGate().
+let inflightUnderflows = 0
+const inflightWaiters: Array<object> = []
+
+export function _inflightActive(): number {
+  return inflightActive
+}
+
+// Debug accessor for the gate: active slots, queued waiters, and unbalanced
+// release count (extra releases past 0, which clamp instead of going
+// negative). Test-only; the hot path never reads it.
+export function _gateStats(): { active: number; queued: number; underflows: number } {
+  return { active: inflightActive, queued: inflightWaiters.length, underflows: inflightUnderflows }
+}
+
+export function _clearInflightGate(): void {
+  try {
+    inflightActive = 0
+    inflightUnderflows = 0
+    inflightWaiters.length = 0
+  } catch {
+    // never throw from test/reset helpers
+  }
+}
+
+export async function acquireInflight(
+  deadline: number,
+  nowFn: () => number,
+  sleepFn: (ms: number) => Promise<void>,
+): Promise<boolean> {
+  const ticket: object = {}
+  inflightWaiters.push(ticket)
+  // F3 bounded polls: the ONLY exit used to be the deadline check
+  // (remaining <= 0), which needs nowFn to advance. A frozen clock plus a
+  // saturated gate spun forever on setImmediate. maxPolls caps total waits
+  // independently of clock progress (remaining/10 + slack), so a frozen
+  // clock still terminates with false (caller reports the existing
+  // no-request-made text). FIFO + deadline semantics unchanged: the deadline
+  // check below still fires first whenever the clock does advance.
+  let maxPolls: number
+  try {
+    const initRem: number = deadline - nowFn()
+    if (typeof initRem !== "number" || Number.isNaN(initRem)) maxPolls = 20_000
+    else if (!Number.isFinite(initRem)) maxPolls = 21_000
+    else maxPolls = Math.max(0, Math.ceil(initRem / 10)) + 20_000
+    if (maxPolls > 50_000) maxPolls = 50_000
+  } catch {
+    maxPolls = 20_000
+  }
+  try {
+    for (let polls = 0; ; polls++) {
+      let cap: number
+      try {
+        cap = maxInflight()
+      } catch {
+        cap = DEFAULT_MAX_INFLIGHT
+      }
+      if (inflightWaiters[0] === ticket && inflightActive < cap) {
+        inflightWaiters.shift()
+        inflightActive++
+        return true
+      }
+      let remaining: number
+      try {
+        remaining = deadline - nowFn()
+      } catch {
+        remaining = 0
+      }
+      if (!(remaining > 0)) {
+        const idx = inflightWaiters.indexOf(ticket)
+        if (idx >= 0) inflightWaiters.splice(idx, 1)
+        return false
+      }
+      // Independent fallback for a frozen clock: polls never advance `remaining`,
+      // so without this cap a saturated gate spins forever. Returns the same
+      // false the deadline path returns (caller keeps the existing
+      // no-request-made text).
+      if (polls >= maxPolls) {
+        const idx = inflightWaiters.indexOf(ticket)
+        if (idx >= 0) inflightWaiters.splice(idx, 1)
+        return false
+      }
+      try {
+        await sleepFn(Math.min(remaining, 10))
+      } catch {
+        const idx = inflightWaiters.indexOf(ticket)
+        if (idx >= 0) inflightWaiters.splice(idx, 1)
+        return false
+      }
+      // Let timers/fetch completions run: a pure microtask spin would starve
+      // the completions that free slots (see block comment above).
+      await new Promise<void>((resolve) => setImmediate(resolve))
+    }
+  } catch {
+    try {
+      const idx = inflightWaiters.indexOf(ticket)
+      if (idx >= 0) inflightWaiters.splice(idx, 1)
+    } catch {
+      // ignore
+    }
+    return false
+  }
+}
+
+export function releaseInflight(): void {
+  try {
+    if (inflightActive > 0) inflightActive--
+    else inflightUnderflows++
+  } catch {
+    // never throw from the hot path
+  }
 }
 
 // In-process bearer cache (60s TTL) so auth.json is not re-read + re-parsed
@@ -687,7 +907,9 @@ export function extractScore(upstream: unknown): number | undefined {
   const o = upstream as Record<string, unknown>
   if (typeof o.score === "number" && Number.isFinite(o.score)) return o.score
   for (const [k, v] of Object.entries(o)) {
-    if (/score/i.test(k) && typeof v === "number" && Number.isFinite(v)) return v
+    // Tight match: exact "score" or snake_case "*_score" only — "scores",
+    // "scoreValue", camelCase and prose never count as a score signal.
+    if (/^(.*_)?score$/i.test(k) && typeof v === "number" && Number.isFinite(v)) return v
   }
   // Bounded BFS for nested {score: n}: prefers shallower matches, guards
   // cycles via `seen`, and never descends past MAX_SCORE_DEPTH or into arrays.
@@ -704,7 +926,7 @@ export function extractScore(upstream: unknown): number | undefined {
           seen.add(child)
           if (typeof child.score === "number" && Number.isFinite(child.score)) return child.score
           for (const [k2, v2] of Object.entries(child)) {
-            if (/score/i.test(k2) && typeof v2 === "number" && Number.isFinite(v2)) return v2
+            if (/^(.*_)?score$/i.test(k2) && typeof v2 === "number" && Number.isFinite(v2)) return v2
           }
           next.push({ obj: child, depth: depth + 1 })
         }
@@ -1362,6 +1584,7 @@ function buildEnvelope(upstream: unknown, meta: JevMeta, state: string): string 
       signalBucket = undefined
     }
   }
+  const gate = computeNeedsSecondSignal({ hint, lowConfidence, bucket: signalBucket })
   const jev = {
     format: 1,
     cached: meta.cached,
@@ -1373,8 +1596,11 @@ function buildEnvelope(upstream: unknown, meta: JevMeta, state: string): string 
     destructive_hint: hint,
     answers,
     low_confidence: lowConfidence,
-    needs_second_signal: computeNeedsSecondSignal({ hint, lowConfidence, bucket: signalBucket }),
+    needs_second_signal: gate,
   }
+  // Gate audit (booleans only — never state, scores, or bucket strings — so
+  // the log stays correlatable without leaking caller input).
+  log("decide.gate.done", { hint: hint === true, bucket: signalBucket === "high", gate: gate === true })
   if (isPlainObject(upstream)) {
     const out: Record<string, unknown> = { ...(upstream as Record<string, unknown>) }
     if (!("bucket" in out) && score !== undefined) out.bucket = bucketFor(score)
@@ -1393,14 +1619,11 @@ export async function decide(
   deps?: DecideDeps,
   variants?: unknown,
 ): Promise<string> {
-  // Calling-convention normalisation: an ARRAY in the deps slot is treated as
-  // the variants list (deps is never legitimately an array), and
-  // deps.variants is the seam-carried alias. Positional `variants` wins.
-  // When no variants are present anywhere this whole block reduces to the
-  // historical path below, byte for byte.
-  const effDeps: DecideDeps | undefined = Array.isArray(deps) ? undefined : deps
-  const effVariants: unknown =
-    variants !== undefined ? variants : Array.isArray(deps) ? deps : effDeps?.variants
+  // Calling-convention normalisation lives in entryArgs (single place);
+  // positional `variants` wins, array-in-deps-slot or deps.variants alias
+  // otherwise. effDeps is already stripped, so the fan-out below cannot
+  // re-inherit the alias.
+  const { deps: effDeps, variants: effVariants } = entryArgs(deps, variants)
   const nowFn = effDeps?.now ?? Date.now
   const sleepFn = effDeps?.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const rngFn = effDeps?.rng ?? Math.random
@@ -1420,7 +1643,7 @@ export async function decide(
         log("decide.fallback", { reason: "invalid-variants", state_chars: state.length })
         return `fallback:true | invalid variants: ${problem}`
       }
-      return await runConsensus(state, effVariants as string[], questions, effDeps)
+      return await runConsensus(state, effVariants as string[], questions, stripVariants(effDeps))
     }
     // Proven working shape (verified via curl to /zen/v1/systemone):
     // questions is an OBJECT map, each entry has type + instructions + criteria.
@@ -1518,16 +1741,114 @@ export async function decide(
     }
 
     const task = (async (): Promise<string> => {
+      // F5: deadline is computed BEFORE the bearer read so an opted-in
+      // JEV_BEARER=1 auth.json read is budget-bounded. The await below is
+      // raced against the remaining budget via the injected sleepFn/nowFn
+      // seams; on timeout the existing budget-exhausted text applies (zero
+      // fetches). Auth behavior preserved: opt-in gate, 60s bearer cache,
+      // refresh-on-401 all unchanged — only the WAIT is bounded.
+      const deadline = Math.min(t0 + OVERALL_BUDGET_MS, effDeps?.deadline ?? Number.POSITIVE_INFINITY)
       let token: string | null
       try {
-        token = await getBearer(effDeps, nowFn())
+        try {
+          const preRemaining = deadline - nowFn()
+          if (!(preRemaining > 0)) {
+            if (heldUsable) return degraded(0)
+            return "fallback:true | budget exhausted before any attempt (no request was made)"
+          }
+        } catch {
+          if (heldUsable) return degraded(0)
+          return "fallback:true | budget exhausted before any attempt (no request was made)"
+        }
+        let nowMs: number
+        try {
+          nowMs = nowFn()
+        } catch {
+          nowMs = t0
+        }
+        const bearerP = getBearer(effDeps, nowMs)
+        // Track settlement without awaiting yet: lets an already-resolved
+        // bearer (token seam, cache hit, immediate readToken, no-auth path)
+        // win WITHOUT touching sleepFn, so fast-path tests see zero sleeps.
+        let settled: { ok: true; value: string | null } | { ok: false; err: unknown } | null = null
+        bearerP.then(
+          (v) => {
+            if (!settled) settled = { ok: true, value: v }
+          },
+          (e) => {
+            if (!settled) settled = { ok: false, err: e }
+          },
+        )
+        // One macrotask yield: drains microtasks so immediate bearers settle
+        // before the budget timer is armed. Not the sleepFn seam (no clock
+        // advance, no slept-entry side effects).
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        if (settled) {
+          if (!settled.ok) throw (settled as { ok: false; err: unknown }).err
+          token = (settled as { ok: true; value: string | null }).value
+        } else {
+          // Slow bearer (hanging readToken / stalled auth.json I/O): poll in
+          // 10ms slices against the same deadline. Bounded independently of
+          // clock progress (remaining/10 + slack) so a frozen clock still
+          // times out instead of hanging past the MCP client timeout.
+          // NOTE: no timeout flag is kept — every exit below converges on the
+          // same budget-exhausted text (zero fetches), so there is no branch
+          // a flag could distinguish; the loop break + !settled check is the
+          // whole vestige-free logic.
+          let maxPolls: number
+          try {
+            const initRem = deadline - nowFn()
+            if (typeof initRem !== "number" || Number.isNaN(initRem)) maxPolls = 20_000
+            else if (!Number.isFinite(initRem)) maxPolls = 21_000
+            else maxPolls = Math.max(0, Math.ceil(initRem / 10)) + 20_000
+            if (maxPolls > 50_000) maxPolls = 50_000
+          } catch {
+            maxPolls = 20_000
+          }
+          for (let i = 0; i < maxPolls; i++) {
+            if (settled) break
+            let rem: number
+            try {
+              rem = deadline - nowFn()
+            } catch {
+              rem = 0
+            }
+            if (!(rem > 0)) {
+              break
+            }
+            try {
+              await sleepFn(Math.min(rem, 10))
+            } catch {
+              break
+            }
+            await new Promise<void>((resolve) => setImmediate(resolve))
+            if (settled) break
+          }
+          if (!settled) {
+            // Timeout wins: suppress any later bearer rejection (handler is
+            // already attached above, so no unhandled rejection) and report
+            // the existing budget-exhausted text with zero fetches.
+            bearerP.then(
+              () => {},
+              () => {},
+            )
+            if (heldUsable) return degraded(0)
+            return "fallback:true | budget exhausted before any attempt (no request was made)"
+          }
+          if (!settled.ok) throw (settled as { ok: false; err: unknown }).err
+          token = (settled as { ok: true; value: string | null }).value
+        }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         log("auth.error", { error: msg.slice(0, 120), state_chars: state.length })
         if (heldUsable) return degraded(0)
         return `fallback:true | error: ${msg.slice(0, 300)}`
       }
-      const deadline = t0 + OVERALL_BUDGET_MS
+      // Per-tool-call request counter (shared across fan-out entries when
+      // threaded through deps by decideBatch; fresh otherwise). Units are
+      // reserved synchronously with the check below, so concurrent entries
+      // can never push the total past MAX_REQUESTS_PER_CALL.
+      const shared = effDeps?.__shared ?? { used: 0 }
       let attempts = 0
       const GENERIC_FALLBACK = "fallback:true | error: upstream request failed"
       let lastFallback = GENERIC_FALLBACK
@@ -1551,25 +1872,54 @@ export async function decide(
         }
         return `fallback:true | HTTP ${status} (rate limited): ${msg}`
       }
+      // Deadline-break detail preservation (DEFECT 1: found live when free-tier
+      // 429s exhausted the budget and the caller was told the bare generic
+      // string): a break must never discard the real error. Reports the most
+      // specific detail observed; if nothing was ever attempted, says THAT
+      // explicitly so "never tried" is distinguishable from "tried and rate
+      // limited". Shared by the loop-top guard, the post-acquire recheck, and
+      // the gate-timeout path below.
+      const noteDeadlineBreak = (): void => {
+        if (attempts === 0 && lastStatus === null && lastError === null) {
+          lastFallback = "fallback:true | budget exhausted before any attempt (no request was made)"
+        } else if (lastFallback === GENERIC_FALLBACK) {
+          if (lastStatus !== null) {
+            lastFallback =
+              lastStatus === 429
+                ? rateLimitFallback(lastStatus, lastBody, lastRetryAfterMs)
+                : `fallback:true | HTTP ${lastStatus}: ${lastBody.slice(0, 500)}`
+          } else if (lastError !== null) {
+            lastFallback = `fallback:true | error: ${lastError.slice(0, 300)}`
+          }
+        }
+      }
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         if (deadline - nowFn() <= 0) {
-          // DEFECT 1 (found live: free-tier 429s exhausted the budget and the
-          // caller was told the bare generic string): a deadline break must
-          // never discard the real error. Report the most specific detail
-          // observed; if nothing was ever attempted, say THAT explicitly so
-          // "never tried" is distinguishable from "tried and rate limited".
-          if (attempts === 0 && lastStatus === null && lastError === null) {
-            lastFallback = "fallback:true | budget exhausted before any attempt (no request was made)"
-          } else if (lastFallback === GENERIC_FALLBACK) {
-            if (lastStatus !== null) {
-              lastFallback =
-                lastStatus === 429
-                  ? rateLimitFallback(lastStatus, lastBody, lastRetryAfterMs)
-                  : `fallback:true | HTTP ${lastStatus}: ${lastBody.slice(0, 500)}`
-            } else if (lastError !== null) {
-              lastFallback = `fallback:true | error: ${lastError.slice(0, 300)}`
-            }
-          }
+          noteDeadlineBreak()
+          break
+        }
+        // Per-tool-call request cap: fail fast before queueing for a slot.
+        // The reserve is synchronous with the check (no await between), so it
+        // is atomic across concurrent entries; a timed-out acquire may leave a
+        // reserved-but-unused unit, erring toward fewer upstream requests.
+        if (shared.used >= MAX_REQUESTS_PER_CALL) {
+          log("decide.fallback", { reason: "request-cap", state_chars: state.length })
+          lastFallback = `fallback:true | request cap exceeded: max ${MAX_REQUESTS_PER_CALL} upstream requests per tool call (back off and retry later)`
+          break
+        }
+        shared.used++
+        // Concurrency gate: at most maxInflight() fetches in flight
+        // process-wide. acquire waits (FIFO) within the same deadline and
+        // returns false when the budget runs out while queueing — then no
+        // request was made and the existing budget-exhausted string applies.
+        if (!(await acquireInflight(deadline, nowFn, sleepFn))) {
+          noteDeadlineBreak()
+          break
+        }
+        // The wait may have consumed the budget: recheck before fetching.
+        if (deadline - nowFn() <= 0) {
+          releaseInflight()
+          noteDeadlineBreak()
           break
         }
         attempts++
@@ -1577,12 +1927,18 @@ export async function decide(
         const timeoutMs = attempt === 1 ? Math.min(FIRST_ATTEMPT_TIMEOUT_MS, remaining) : remaining
         let res: Response
         try {
-          res = await fetchFn(ENDPOINT, {
-            method: "POST",
-            headers: authHeaders(token),
-            body: JSON.stringify({ model: MODEL, state, questions: q }),
-            signal: AbortSignal.timeout(timeoutMs),
-          })
+          try {
+            res = await fetchFn(ENDPOINT, {
+              method: "POST",
+              headers: authHeaders(token),
+              body: JSON.stringify({ model: MODEL, state, questions: q }),
+              signal: AbortSignal.timeout(timeoutMs),
+            })
+          } finally {
+            // Release as soon as headers resolve — the slot is never held
+            // across body parsing (below) or backoff sleeps.
+            releaseInflight()
+          }
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e)
           lastError = msg
@@ -1602,7 +1958,7 @@ export async function decide(
         }
         if (res.ok) {
           const data: unknown = await res.json().catch(() => null)
-          if (data === null || data === undefined) {
+          if (data === null || data === undefined || (isPlainObject(data) && Object.keys(data).length === 0)) {
             log("decide.fallback", { reason: "empty-upstream", state_chars: state.length })
             lastFallback = "fallback:true | empty upstream response"
             break
@@ -1704,12 +2060,68 @@ export async function decide(
   }
 }
 
-// Generic entry point: merges state + context, then delegates to decide.
+// Internal core: merges state + context, then fans out or delegates to
+// decide. Takes an already-normalised EntryArgs (see entryArgs) so the
+// calling-convention logic lives in exactly one place. Never throws; any
+// failure returns a `fallback:true | ...` string.
+// Optional variants: each variant is serialized with the SAME context and
+// asked the SAME questions, then aggregated by runConsensus. Absent variants
+// take the exact historical single-state path below.
+export async function runWithContext(
+  state: unknown,
+  context: unknown,
+  questions: unknown,
+  args: EntryArgs,
+): Promise<string> {
+  try {
+    const { deps: effDeps, variants: effVariants } = args
+    // Serialized ONCE for the funnel below: the fallback suffix is derived
+    // from this exact string. Success envelopes already carry
+    // _jev.destructive_hint, so they pass through untouched.
+    let serialized: string
+    try {
+      serialized = serializeState(state, context)
+    } catch {
+      serialized = ""
+    }
+    let result: string
+    if (effVariants !== undefined) {
+      const problem = validateVariants(effVariants)
+      if (problem) {
+        log("decide.fallback", { reason: "invalid-variants" })
+        result = `fallback:true | invalid variants: ${problem}`
+      } else if (serialized.trim().length === 0) {
+        log("decide.fallback", { reason: "empty-state", state_chars: 0 })
+        result =
+          "fallback:true | empty state: at least one of state (non-blank string) or context (object) is required"
+      } else {
+        const variantStates = (effVariants as string[]).map((v) => serializeState(v, context))
+        result = await runConsensus(serialized, variantStates, questions, effDeps)
+      }
+    } else {
+      result = await decide(serialized, questions, effDeps)
+    }
+    // Fallback hint suffix: a `fallback:true` string carries no _jev block,
+    // so without this the destructive shape would go unreported. Appended
+    // ONLY when the serialized state hints destructive; byte-identical
+    // otherwise. The includes guard keeps the suffix idempotent.
+    if (
+      result.startsWith("fallback:true | ") &&
+      !result.includes("destructive_hint:true") &&
+      destructiveHint(serialized)
+    ) {
+      result += " | destructive_hint:true"
+    }
+    return result
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    log("decide.fallback", { reason: "context-exception", error: msg.slice(0, 120) })
+    return `fallback:true | error: ${msg.slice(0, 300)}`
+  }
+}
+
+// Generic entry point: adapter over runWithContext (signatures preserved).
 // Never throws; any failure returns a `fallback:true | ...` string.
-// Optional `variants` (positional, deps.variants alias, or an array in the
-// deps slot): each variant is serialized with the SAME context and asked the
-// SAME questions, then aggregated by runConsensus. Absent variants take the
-// exact historical single-state path below.
 export async function decideWithContext(
   state?: unknown,
   context?: unknown,
@@ -1717,30 +2129,27 @@ export async function decideWithContext(
   deps?: DecideDeps,
   variants?: unknown,
 ): Promise<string> {
-  try {
-    const effDeps: DecideDeps | undefined = Array.isArray(deps) ? undefined : deps
-    const effVariants: unknown =
-      variants !== undefined ? variants : Array.isArray(deps) ? deps : effDeps?.variants
-    if (effVariants !== undefined) {
-      const problem = validateVariants(effVariants)
-      if (problem) {
-        log("decide.fallback", { reason: "invalid-variants" })
-        return `fallback:true | invalid variants: ${problem}`
-      }
-      const base = serializeState(state, context)
-      if (base.trim().length === 0) {
-        log("decide.fallback", { reason: "empty-state", state_chars: 0 })
-        return "fallback:true | empty state: at least one of state (non-blank string) or context (object) is required"
-      }
-      const variantStates = (effVariants as string[]).map((v) => serializeState(v, context))
-      return await runConsensus(base, variantStates, questions, effDeps)
-    }
-    return await decide(serializeState(state, context), questions, effDeps)
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    log("decide.fallback", { reason: "context-exception", error: msg.slice(0, 120) })
-    return `fallback:true | error: ${msg.slice(0, 300)}`
-  }
+  return runWithContext(state, context, questions, entryArgs(deps, variants))
+}
+
+// Preset question factories: one entry per context-free convenience tool.
+// The factory is called per invocation so each call gets a fresh object.
+export const PRESETS = {
+  route_expert: defaultQuestions,
+  assess_risk: riskQuestions,
+} as const
+
+export type PresetName = keyof typeof PRESETS
+
+// Preset dispatch: look up the factory, build fresh questions, run the core.
+export async function decideWithPreset(
+  name: PresetName,
+  state?: unknown,
+  context?: unknown,
+  deps?: DecideDeps,
+  variants?: unknown,
+): Promise<string> {
+  return runWithContext(state, context, PRESETS[name](), entryArgs(deps, variants))
 }
 
 // Convenience: route to expert(s) with default questions.
@@ -1750,10 +2159,7 @@ export async function routeExpert(
   deps?: DecideDeps,
   variants?: unknown,
 ): Promise<string> {
-  const effDeps: DecideDeps | undefined = Array.isArray(deps) ? undefined : deps
-  const effVariants: unknown =
-    variants !== undefined ? variants : Array.isArray(deps) ? deps : effDeps?.variants
-  return decideWithContext(state, context, defaultQuestions(), effDeps, effVariants)
+  return decideWithPreset("route_expert", state, context, deps, variants)
 }
 
 // Convenience: score blast radius / review need only.
@@ -1763,10 +2169,7 @@ export async function assessRisk(
   deps?: DecideDeps,
   variants?: unknown,
 ): Promise<string> {
-  const effDeps: DecideDeps | undefined = Array.isArray(deps) ? undefined : deps
-  const effVariants: unknown =
-    variants !== undefined ? variants : Array.isArray(deps) ? deps : effDeps?.variants
-  return decideWithContext(state, context, riskQuestions(), effDeps, effVariants)
+  return decideWithPreset("assess_risk", state, context, deps, variants)
 }
 
 // ---------------------------------------------------------------------------
@@ -1822,6 +2225,22 @@ export async function decideBatch(requests: unknown, deps?: BatchDeps): Promise<
       poolSize = Math.max(1, Math.floor(deps.concurrency))
     }
     const t0 = (deps?.now ?? Date.now)()
+    // Wall-clock budget: one toolDeadline per batch call — the tighter of a
+    // fresh 10s budget and an inherited deadline (nested consensus/batch only
+    // ever tightens, never extends). Every entry inherits it via deps, so an
+    // entry starting with no budget left falls back immediately with the
+    // existing budget-exhausted text while the rest still return envelopes
+    // (partial success in {results, summary}).
+    const toolDeadline = Math.min(t0 + OVERALL_BUDGET_MS, deps?.deadline ?? Number.POSITIVE_INFINITY)
+    // Per-tool-call request counter shared by every entry (a nested call
+    // reuses the outer object so the cap spans the whole fan-out, not each
+    // level). Late entries past MAX_REQUESTS_PER_CALL fall back solo.
+    const shared = deps?.__shared ?? { used: 0 }
+    // F1: build entry deps from deps WITH the consumable `variants` alias
+    // stripped. An entry that inherited the alias would re-enter consensus and
+    // fan out again (unbounded). Per-entry `variants` (passed positionally in
+    // runOne) are unaffected and still work.
+    const entryDeps = { ...stripVariants(deps), deadline: toolDeadline, __shared: shared } as BatchDeps
     log("decide.batch.start", { count: requests.length, pool: poolSize })
     const results: string[] = new Array(requests.length)
     let next = 0
@@ -1831,7 +2250,7 @@ export async function decideBatch(requests: unknown, deps?: BatchDeps): Promise<
           return "fallback:true | batch entry must be an object with state and/or context"
         }
         const e = entry as Record<string, unknown>
-        return await decideWithContext(e.state, e.context, e.questions, deps, e.variants)
+        return await decideWithContext(e.state, e.context, e.questions, entryDeps, e.variants)
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         log("decide.batch.fallback", { reason: "entry-exception", error: msg.slice(0, 120) })
@@ -1959,9 +2378,11 @@ async function runConsensus(
   const nowFn = deps?.now ?? Date.now
   const t0 = nowFn()
   try {
+    // F1: strip the consumable `variants` alias before forwarding deps into the
+    // fan-out, so a variants-carrying deps can never re-inherit and recurse.
     const batchText = await decideBatch(
       variantStates.map((s) => ({ state: s, questions })),
-      deps,
+      stripVariants(deps),
     )
     if (typeof batchText === "string" && batchText.startsWith("fallback:true | ")) return batchText
     let results: unknown
@@ -2072,6 +2493,12 @@ async function runConsensus(
       consensus,
     }
     const text = JSON.stringify(out)
+    // Gate audit (booleans only — never variant states or scores).
+    log("decide.gate.done", {
+      hint: hint === true,
+      bucket: medianBucket === "high",
+      gate: (out._jev as Record<string, unknown>).needs_second_signal === true,
+    })
     log("decide.done", {
       state_chars: baseState.length,
       response_chars: text.length,
@@ -2196,17 +2623,32 @@ export async function selfcheck(deps?: SelfcheckDeps): Promise<string> {
       upstream = "offline: probe skipped (JEV_SELFCHECK_LIVE=0); no request sent"
     } else {
       mode = "online (1 probe call, no retry)"
-      try {
-        const res = await fetchFn(ENDPOINT, {
-          method: "POST",
-          headers: authHeaders(token),
-          body: JSON.stringify({
-            model: MODEL,
-            state: "selfcheck probe",
-            questions: { probe: { type: "noul", instructions: "connectivity probe; no judgement needed" } },
-          }),
-          signal: AbortSignal.timeout(FIRST_ATTEMPT_TIMEOUT_MS),
-        })
+      // Process-wide concurrency gate (same semaphore as decide): the probe
+      // waits its turn within the probe timeout; a saturated gate reports
+      // busy instead of piling on. No sleep seam exists here so waits use a
+      // real timer. Never the fallback contract — a busy gate is a successful
+      // diagnosis with ok:true, not a failure.
+      const probeDeadline = nowFn() + FIRST_ATTEMPT_TIMEOUT_MS
+      const realSleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms))
+      if (!(await acquireInflight(probeDeadline, nowFn, realSleep))) {
+        upstream = "busy: too many in-flight requests (no request was made); tip: retry shortly"
+      } else try {
+        let res: Response
+        try {
+          res = await fetchFn(ENDPOINT, {
+            method: "POST",
+            headers: authHeaders(token),
+            body: JSON.stringify({
+              model: MODEL,
+              state: "selfcheck probe",
+              questions: { probe: { type: "noul", instructions: "connectivity probe; no judgement needed" } },
+            }),
+            signal: AbortSignal.timeout(FIRST_ATTEMPT_TIMEOUT_MS),
+          })
+        } finally {
+          // Release as soon as headers resolve — never held across body text().
+          releaseInflight()
+        }
         if (res.ok) {
           upstream = `reachable: HTTP ${res.status} (upstream answered the probe)`
         } else {

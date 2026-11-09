@@ -196,6 +196,7 @@ on `fallback:true`, proceed on your own judgement without retry-spamming.
 | Bad `variants` | `fallback:true \| invalid variants: …` | 1–5 non-blank strings |
 | Missing/blank state+context | `fallback:true \| empty state: …` | At least one of: non-blank `state` string, or `context` object with ≥1 usable key |
 | 401/403/422 | `fallback:true \| HTTP …` | **Never retried** — bad key or client shape; retrying is pointless load |
+| Over-budget / over-cap entries (batch/consensus fan-out) | Per-entry `fallback:true \| budget exhausted before any attempt (no request was made)` or `fallback:true \| request cap exceeded: max 12 …` — the rest of the batch still returns | One tool call shares a single 10s wall-clock deadline and at most 12 upstream requests across all entries/variants/retries; late entries fall back solo instead of overrunning the 15s client timeout |
 | 429/500/502/503/504 | Retried (≤3 attempts, jittered backoff, Retry-After honoured ≤8s) inside the 10s budget | A retry whose wait **cannot fit the remaining budget is skipped, not slept through** — the 429 is reported immediately with its Retry-After |
 
 Auth default: **no** `Authorization` header is sent, because the free-tier
@@ -206,6 +207,10 @@ cached 60s in-process, refreshed once on 401).
 Other budgets worth knowing: state capped at 8000 chars (truncated with an
 explicit marker — keys never dropped); per-context-value cap 2000 chars; first
 attempt times out at 4s; in-flight identical requests share one network call;
+at most 4 upstream fetches in flight process-wide (`JEV_MAX_INFLIGHT` 1..8
+overrides); one tool call shares a single 10s wall-clock deadline and at most
+12 upstream requests across all entries/variants/retries (late entries fall
+back solo);
 scores jitter (sd ~0.025) so choice answers cache 6h but score/noul answers
 cache only 60s.
 

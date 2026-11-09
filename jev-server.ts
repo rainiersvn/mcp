@@ -97,34 +97,42 @@ function fail(id: number | string | null, code: number, message: string) {
 
 const STATE_PROP = {
   type: "string",
-  description: "Request summary; need state/context.",
+  description: "State.",
   minLength: 1,
 } as const
 const CONTEXT_PROP = {
   type: "object",
-  description: "Context object, any keys.",
+  description: "Context.",
 } as const
 const QUESTIONS_PROP = {
   type: "object",
-  description: "Custom questions map.",
+  description: "Questions.",
 } as const
 const VARIANTS_PROP = {
   type: "array",
-  description: "Alt phrasings; median consensus.",
+  description: "Variants.",
   minItems: 1,
   maxItems: 5,
   items: { type: "string", minLength: 1 },
 } as const
 
-const Q_SHAPE = `Each entry: type("choice"|"score"|"noul")+instructions+criteria(map|array).`
-const GOTCHA_422 = `GOTCHA: questions is an object map, never an array (array->422).`
-const BRACKET = `Code: tools["jev"].<t>; see discover.`
+const GOTCHA_422 = `questions is an object map, never an array (array->422).`
 // Accuracy note: known-tool failures (argument-validation AND upstream /
 // execution failures) always come back as a *result* whose content[0].text
 // starts "fallback:true | " with isError:true. Only these four codes are real
 // JSON-RPC errors with no text: bad envelope -32600, unparsable line -32700,
 // unknown method -32601, unknown tool -32602.
-const FALLBACK = `Failures: fallback:true text, isError:true.`
+const FALLBACK = `Failures: fallback:true, isError:true.`
+
+// All six tools are read-only, idempotent, non-destructive. Only discover is
+// closed-world (static discoverPayload); the other five fetch
+// https://opencode.ai/zen/v1/systemone (selfcheck live-probes by default).
+// Spec defaults are readOnly=false/idempotent=false/openWorld=true/
+// destructive=true, so all four hints must be sent (nothing omittable).
+// Descriptions stay terse on purpose: tools/list bytes are budgeted (<=3650)
+// and the full contract (entry shape, code-mode, 422) lives in discover.
+const RO_OPEN = { readOnlyHint: true, idempotentHint: true, openWorldHint: true, destructiveHint: false } as const
+const RO_CLOSED = { readOnlyHint: true, idempotentHint: true, openWorldHint: false, destructiveHint: false } as const
 
 // Exported for inspection/debugging (the size test measures the live
 // tools/list bytes over stdio instead of importing this module, so the
@@ -132,7 +140,9 @@ const FALLBACK = `Failures: fallback:true text, isError:true.`
 export const TOOLS = [
   {
     name: "decide",
-    description: `Routing decision with custom questions map + state/context. ${Q_SHAPE} ${GOTCHA_422} ${BRACKET} ${FALLBACK}`,
+    title: "Decide",
+    description: `Decision: questions map + state/context. ${GOTCHA_422} ${FALLBACK}`,
+    annotations: RO_OPEN,
     inputSchema: {
       type: "object",
       properties: { state: STATE_PROP, context: CONTEXT_PROP, questions: QUESTIONS_PROP, variants: VARIANTS_PROP },
@@ -142,7 +152,9 @@ export const TOOLS = [
   },
   {
     name: "route_expert",
-    description: `Routing: which expert (@planner/@coder/@reviewer) + review need. Default probe. Need state/context. ${BRACKET} ${FALLBACK}`,
+    title: "Route expert",
+    description: `Which expert (@planner/@coder/@reviewer) + review need. Need state/context. ${FALLBACK}`,
+    annotations: RO_OPEN,
     inputSchema: {
       type: "object",
       properties: { state: STATE_PROP, context: CONTEXT_PROP, variants: VARIANTS_PROP },
@@ -152,7 +164,9 @@ export const TOOLS = [
   },
   {
     name: "assess_risk",
-    description: `Risk probe: blast-radius/review score only. Use before risky changes. Need state/context. ${BRACKET} ${FALLBACK}`,
+    title: "Assess risk",
+    description: `Blast-radius/review score. Need state/context. ${FALLBACK}`,
+    annotations: RO_OPEN,
     inputSchema: {
       type: "object",
       properties: { state: STATE_PROP, context: CONTEXT_PROP, variants: VARIANTS_PROP },
@@ -162,23 +176,29 @@ export const TOOLS = [
   },
   {
     name: "discover",
-    description: `Discover: call first if unsure. Types, fields, 422 warning, context rules, examples. ${BRACKET}`,
+    title: "Discover",
+    description: `Call first if unsure. Types, fields, 422 warning, context rules, examples.`,
+    annotations: RO_CLOSED,
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "selfcheck",
-    description: `Selfcheck: fast operator diagnosis (reachability, auth, budget, cache, catalogue). No args. JEV_SELFCHECK_LIVE=0 skips the probe call (fully offline).`,
+    title: "Selfcheck",
+    description: `Selfcheck: operator diagnosis (reachability, auth, budget, cache, catalogue). JEV_SELFCHECK_LIVE=0 skips probe (offline).`,
+    annotations: RO_OPEN,
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "batch",
-    description: `Batch: several judgements about one task in one round trip under different framings, not one decision. Pool of 4, max 8; bad entries fail solo. See discover.`,
+    title: "Batch",
+    description: `Batch: several judgements about one task in one round trip under different framings. Pool of 4, max 8; bad entries fail solo. ${FALLBACK}`,
+    annotations: RO_OPEN,
     inputSchema: {
       type: "object",
       properties: {
         requests: {
           type: "array",
-          description: "Batch of {state,context?,questions?,variants?} entries, max 8.",
+          description: "Entries, max 8.",
           minItems: 1,
           maxItems: 8,
           items: {
@@ -211,6 +231,23 @@ function needState(args: any): string | null {
     return "at least one of state (non-blank string) or context (object with at least one usable key) is required"
   }
   return null
+}
+
+// Table-driven dispatch for the three state/context decision tools. They
+// share one contract (needState validation, then a text result via okText),
+// so one table row each — no per-tool switch branches to drift. discover /
+// selfcheck / batch keep their own shapes and stay explicit below.
+type DecisionHandler = (args: {
+  state?: unknown
+  context?: unknown
+  questions?: unknown
+  variants?: unknown
+}) => Promise<string>
+
+const DECISION_HANDLERS: Record<string, DecisionHandler> = {
+  decide: (args) => decideWithContext(args.state, args.context, args.questions, undefined, args.variants),
+  route_expert: (args) => routeExpert(args.state, args.context, undefined, args.variants),
+  assess_risk: (args) => assessRisk(args.state, args.context, undefined, args.variants),
 }
 
 async function handle(raw: unknown) {
@@ -282,25 +319,14 @@ async function handle(raw: unknown) {
       case "tools/call": {
         const name = msg.params?.name
         const args = msg.params?.arguments ?? {}
+        const decisionHandler = typeof name === "string" ? DECISION_HANDLERS[name] : undefined
+        if (decisionHandler) {
+          const errMsg = needState(args)
+          if (errMsg) return validationFail(errMsg)
+          const text = await decisionHandler(args)
+          return okText(text)
+        }
         switch (name) {
-          case "decide": {
-            const errMsg = needState(args)
-            if (errMsg) return validationFail(errMsg)
-            const text = await decideWithContext(args.state, args.context, args.questions, undefined, args.variants)
-            return okText(text)
-          }
-          case "route_expert": {
-            const errMsg = needState(args)
-            if (errMsg) return validationFail(errMsg)
-            const text = await routeExpert(args.state, args.context, undefined, args.variants)
-            return okText(text)
-          }
-          case "assess_risk": {
-            const errMsg = needState(args)
-            if (errMsg) return validationFail(errMsg)
-            const text = await assessRisk(args.state, args.context, undefined, args.variants)
-            return okText(text)
-          }
           case "discover":
             return ok({
               content: [{ type: "text", text: JSON.stringify(discoverPayload()) }],

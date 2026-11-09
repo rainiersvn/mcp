@@ -24,6 +24,12 @@ import {
   riskQuestions,
   validateVariants,
 } from "./jev-core.ts";
+// The native TUI wrappers (tools/*.ts) are the second surface on top of this
+// core; they are imported here so the parity assertions below can check BOTH
+// surfaces against one another instead of trusting the source by eye.
+import jevAssessRiskTool from "../tools/jev-assess-risk.ts";
+import jevDecideTool from "../tools/jev.ts";
+import jevRouteExpertTool from "../tools/jev-route-expert.ts";
 
 const FALLBACK_PREFIX = "fallback:true | ";
 const T_NOW = 70_000_000;
@@ -298,6 +304,58 @@ describe("variant validation fails clean with no network call", () => {
   });
 });
 
+describe("F1: deps.variants alias is consumed once (single-level, no recursion)", () => {
+  // Regression for the unbounded-recursion bug: the `variants` field on deps is
+  // a consumable alias. Before the fix it was copied onto every fan-out entry,
+  // each entry re-read it, and the call never settled (stack exhaustion / hang).
+  // These call the exact reproducers with a VALID (non-empty) alias and assert
+  // both termination and that the fan-out happens exactly ONCE.
+  const V = ["f1-var-a", "f1-var-b", "f1-var-c"];
+  const SCORES = { "f1-var-a": 0.4, "f1-var-b": 0.5, "f1-var-c": 0.6 };
+
+  test("decide(deps.variants=valid) terminates with one fan-out of N", async () => {
+    fresh();
+    const { deps, calls } = scoreDeps(SCORES);
+    const callerDeps = { ...deps, variants: V };
+    const raw = await decide("f1 base task", riskQuestions(), callerDeps);
+    assert.ok(!raw.startsWith(FALLBACK_PREFIX), raw.slice(0, 160));
+    const p = JSON.parse(raw) as any;
+    assert.equal(p._jev.consensus.n, V.length);
+    assert.equal(p._jev.consensus.variants.length, V.length);
+    assert.equal(p._jev.consensus.median_score, 0.5, "median of [0.4,0.5,0.6]");
+    // Exactly one request per variant. A recursive re-fan would be N, N*N, ...
+    assert.equal(calls(), V.length, "one request per variant, single level");
+    // Non-destructive: the caller's deps object is not mutated by the strip.
+    assert.deepEqual(callerDeps.variants, V);
+  });
+
+  test("decideBatch(reqs, deps.variants=valid) terminates; alias is not inherited by entries", async () => {
+    fresh();
+    const { deps, calls } = scoreDeps(SCORES);
+    const raw = await decideBatch([{ state: "f1-batch-one" }, { state: "f1-batch-two" }], { ...deps, variants: V });
+    assert.ok(!raw.startsWith(FALLBACK_PREFIX), raw.slice(0, 160));
+    const out = JSON.parse(raw) as { results: string[]; summary: Record<string, number> };
+    assert.equal(out.results.length, 2);
+    for (const r of out.results) {
+      assert.ok(!r.startsWith(FALLBACK_PREFIX), r.slice(0, 160));
+      assert.equal("consensus" in (JSON.parse(r) as any)._jev, false, "batch-level alias must not scale an entry");
+    }
+    // Two plain entries => two requests, no nested consensus fan-out at all.
+    assert.equal(calls(), 2, "batch-level alias adds zero nested fan-out");
+  });
+
+  test("assessRisk(deps.variants=valid) terminates with one fan-out of N", async () => {
+    fresh();
+    const two = ["f1-var-a", "f1-var-b"];
+    const { deps, calls } = scoreDeps(SCORES);
+    const raw = await assessRisk("f1 wrapper task", undefined, { ...deps, variants: two });
+    assert.ok(!raw.startsWith(FALLBACK_PREFIX), raw.slice(0, 160));
+    const p = JSON.parse(raw) as any;
+    assert.equal(p._jev.consensus.n, two.length);
+    assert.equal(calls(), two.length);
+  });
+});
+
 describe("noul-only question set with variants (no invented score/bucket)", () => {
   const noulQ = { verdict: { type: "noul", instructions: "Any safety concern with this task?" } };
 
@@ -348,6 +406,9 @@ describe("server: variants in the MCP inputSchemas (spawned, offline)", () => {
   test("decide/route_expert/assess_risk/batch-items expose variants 1..5", async () => {
     const serverPath = fileURLToPath(new URL("./jev-server.ts", import.meta.url));
     const child = spawn(process.execPath, [serverPath], { stdio: ["pipe", "pipe", "pipe"] });
+    // Declared outside the try so the native-wrapper parity assertions after
+    // the finally can reuse the live MCP schemas they compare against.
+    let byName: Record<string, any> = {};
     try {
       const tools = await new Promise<any[]>((resolve, reject) => {
         let buf = "";
@@ -373,7 +434,7 @@ describe("server: variants in the MCP inputSchemas (spawned, offline)", () => {
         child.stderr.on("data", () => {});
         child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
       });
-      const byName = Object.fromEntries(tools.map((t: any) => [t.name, t.inputSchema]));
+      byName = Object.fromEntries(tools.map((t: any) => [t.name, t.inputSchema]));
       for (const name of ["decide", "route_expert", "assess_risk"]) {
         const v = byName[name].properties.variants;
         assert.ok(v, `${name} must expose variants`);
@@ -393,6 +454,75 @@ describe("server: variants in the MCP inputSchemas (spawned, offline)", () => {
         // already gone
       }
       await new Promise((r) => child.on("close", r));
+    }
+
+    // Native TUI parity (tools/jev.ts, tools/jev-route-expert.ts,
+    // tools/jev-assess-risk.ts). These live in THIS test rather than a new file
+    // on purpose: the suite's own count (tests/pass/skip) is part of the
+    // contract, so the assertion is folded into the existing surface-parity
+    // test. The drift being pinned: all wrappers advertised nothing extra and
+    // called routeExpert(state, context) / assessRisk(state, context) /
+    // decideWithContext(state, context, questions), so `variants` was silently
+    // dropped and a TUI consensus call became ONE decision while MCP still
+    // fanned out — two surfaces, one schema, different behaviour.
+    const wrappers: Array<[string, any]> = [
+      ["decide", jevDecideTool],
+      ["route_expert", jevRouteExpertTool],
+      ["assess_risk", jevAssessRiskTool],
+    ];
+    for (const [name, def] of wrappers) {
+      // Same advertised key set as the MCP inputSchema props, nothing more.
+      assert.deepEqual(
+        Object.keys(def.args).sort(),
+        Object.keys(byName[name].properties).sort(),
+        `${name}: TUI wrapper args must mirror the MCP schema props exactly`,
+      );
+      // `deps` is a transport/test seam for the core; it is not part of either
+      // advertised surface, so it must not leak into the wrapper schema.
+      assert.ok(!Object.hasOwn(def.args, "deps"), `${name}: deps must not be advertised`);
+    }
+
+    // Forwarding, not just shape. Two variants must reach the core as two
+    // fanned-out decisions, and they must travel through the CALLER's deps seam
+    // rather than the global fetch (the global one is stubbed and counted so
+    // this stays offline and cannot silently hit the network if the seam is
+    // dropped).
+    for (const [name, def] of wrappers) {
+      fresh();
+      let seamCalls = 0;
+      let globalCalls = 0;
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async () => {
+        globalCalls++;
+        return okJson(scoreBody(1));
+      }) as typeof fetch;
+      try {
+        const seam = {
+          fetchImpl: async () => {
+            seamCalls++;
+            return okJson(scoreBody(1));
+          },
+          token: "tok-test",
+          now: () => T_NOW,
+          sleep: async (_ms: number) => {},
+          rng: () => 0,
+        };
+        const text = (await def.execute({
+          state: "parity base task",
+          variants: ["parity variant one", "parity variant two"],
+          deps: seam,
+        })) as string;
+        assert.ok(!text.startsWith(FALLBACK_PREFIX), `${name}: ${text.slice(0, 160)}`);
+        assert.equal(seamCalls, 2, `${name}: two variants => two fanned-out decisions via deps`);
+        assert.equal(globalCalls, 0, `${name}: deps.fetchImpl must be used, not global fetch`);
+        assert.equal(
+          (JSON.parse(text) as any)._jev.consensus.variants.length,
+          2,
+          `${name}: consensus detail must carry both variants`,
+        );
+      } finally {
+        globalThis.fetch = realFetch;
+      }
     }
   });
 });
