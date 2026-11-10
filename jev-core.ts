@@ -200,6 +200,26 @@ export function riskQuestions() {
   }
 }
 
+// Path-based walker for the FIRST non-plain-JSON value inside a questions
+// entry, or null. BigInt and circular references throw inside canonicalJson
+// (cacheKeyFor) as a bare "Do not know how to serialize…" error; failing fast
+// here gives a clear message instead. `seen` is path-scoped (added on the way
+// down, removed on the way up) so a shared non-circular reference passes —
+// JSON.stringify only throws on a true cycle.
+function firstNonPlainJson(v: unknown, seen: Set<object>): string | null {
+  if (typeof v === "bigint") return "BigInt"
+  if (v !== null && typeof v === "object") {
+    if (seen.has(v)) return "circular reference"
+    seen.add(v)
+    for (const child of Object.values(v as Record<string, unknown>)) {
+      const found = firstNonPlainJson(child, seen)
+      if (found) return found
+    }
+    seen.delete(v)
+  }
+  return null
+}
+
 // Client-side shape check for caller-supplied questions. Returns a problem
 // string or null when the shape is acceptable. Rejects malformed shapes
 // locally so a bad shape does not cost a network round trip to come back as
@@ -240,6 +260,11 @@ export function validateQuestions(questions: unknown): string | null {
       }
     }
     // noul: criteria absent or anything — no constraint.
+    // (E) BigInt / circular criteria would otherwise throw later inside
+    // canonicalJson (cacheKeyFor) and surface as a confusing serialize-error
+    // fallback; fail fast with a message that names the offender.
+    const nonPlain = firstNonPlainJson(q, new Set())
+    if (nonPlain) return `question "${name}" contains a ${nonPlain}; questions must be plain JSON`
   }
   return null
 }
@@ -631,6 +656,24 @@ const jevInflight = new Map<string, Promise<string>>()
 function touchCache(key: string, entry: CacheEntry): void {
   jevCache.delete(key)
   jevCache.set(key, entry)
+}
+
+// (A) Is this 200 payload safe to cache as a success? Cacheable: non-object
+// upstream (the pinned {raw} wrap path), an `answers` map extractAnswers can
+// summarize, a score extractScore can find, or a LEGACY flat answer map
+// ({expert:"planner"}, root scalars — pre-`answers` upstream, pinned by the
+// 6h-cache regression guard). NOT cacheable: a plain object with none of
+// those — e.g. drifted foreign envelopes ({content:[…]}) — which would
+// otherwise live 6h (or 60s) as a bogus "success". Never throws.
+function cacheableUpstream(data: unknown): boolean {
+  if (!isPlainObject(data)) return true
+  if (Object.keys(extractAnswers(data)).length > 0 || extractScore(data) !== undefined) return true
+  return (
+    Object.keys(data).length > 0 &&
+    Object.values(data).every(
+      (v) => typeof v === "string" || typeof v === "number" || typeof v === "boolean",
+    )
+  )
 }
 
 function storeCache(key: string, upstream: unknown, at: number, rawState: string): void {
@@ -1964,7 +2007,13 @@ export async function decide(
             break
           }
           const stamped = nowFn()
-          storeCache(key, data, stamped, state)
+          // (A) Cache only payloads that yield a usable answer — upstream
+          // shape drift ({content:[…]}) must not live a full TTL as a bogus
+          // "success". Uncacheable payloads still return the envelope; the
+          // failure mode is a re-fetch next call, never a fallback.
+          if (cacheableUpstream(data)) {
+            storeCache(key, data, stamped, state)
+          }
           const text = buildEnvelope(
             data,
             { cached: "none", cache_age_ms: 0, attempts, latency_ms: stamped - t0, stale: false },
@@ -2674,6 +2723,7 @@ export async function selfcheck(deps?: SelfcheckDeps): Promise<string> {
 
     // --- catalogue health: cheap, no network ---
     let catalogue = "unknown (catalogue check failed)"
+    let catalogueOk = false
     try {
       const total = DESTRUCTIVE_PATTERNS.length
       let callable = 0
@@ -2690,8 +2740,12 @@ export async function selfcheck(deps?: SelfcheckDeps): Promise<string> {
         callable === total
           ? `ok (${callable}/${total} families callable)`
           : `DEGRADED (${callable}/${total} families callable)`
+      // (D) Machine-readable twin of the catalogue string. Additive: `ok`
+      // keeps its "the check ran" meaning (a degraded catalogue is still a
+      // successful diagnosis) so existing consumers cannot break.
+      catalogueOk = callable === total
     } catch {
-      // keep "unknown"
+      // keep "unknown" and catalogueOk false
     }
 
     let nodeVer = "unknown"
@@ -2725,6 +2779,7 @@ export async function selfcheck(deps?: SelfcheckDeps): Promise<string> {
       bearer_cache: { file_reads: _bearerStats.fileReads, rereads: _bearerStats.rereads, hits: _bearerStats.cacheHits },
       destructive_families: DESTRUCTIVE_PATTERNS.length,
       catalogue,
+      catalogue_ok: catalogueOk,
       battle_suite: "20 dangerous + 24 safe; census offline: node --test jev-battle.test.ts",
       model: MODEL,
       endpoint: ENDPOINT,
@@ -2764,7 +2819,7 @@ export function discoverPayload() {
       scores: "bkt<=1 low,<=2 med,>2 high(sd.025).",
       expert_choice: "choice 6h;score/noul 60s",
       blind_spot:
-        "glob~2.1,rm-rf~2.96;hint rm/glob/drop/format;never gate 1 score",
+        "glob~2.1,rm-rf~2.96;never gate 1 score",
     },
     answers_note:
       "choice{choice,conf,prob} score{score,conf,prob,bkt} noul{noul,bkt}",
@@ -2773,11 +2828,11 @@ export function discoverPayload() {
     batch_note:
       "batch N/roundtrip;pool4 max8;bad fail solo",
     recommended_usage:
-      "discover 1st;assess_risk if risky;gate on needs_second_signal=hint/high/disagree;low_conf alone quiet;variants1-5 median.",
+      "discover 1st;assess_risk if risky;gate on needs_second_signal=hint/high/disagree;variants1-5 median.",
     response_envelope:
       "upstream@root+_jev{format,cached,stale,answers,low_confidence,needs_second_signal,consensus{median,spread,agree}};else fallback:true|;non-obj raw.",
     code_mode_note:
-      "tools[\"jev\"].<t> via search",
+      "codemode:tools.jev.<t>;TUI:tools/jev*.ts;no isError;match 'fallback:true | '",
     examples: {
       decide: { state: "B" },
       decide_with_context: {

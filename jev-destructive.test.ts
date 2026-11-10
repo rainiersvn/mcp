@@ -49,7 +49,7 @@ function assertSilent(name: string, states: string[]): void {
 }
 
 describe("destructiveHint catalogue (each family individually)", () => {
-  test("all nineteen families are exported with a name, why, and RegExp", () => {
+  test("all twenty-six families are exported with a name, why, and RegExp", () => {
     // NOTE (extension-style change): was thirteen families; the four appended
     // entries below are the DELIBERATE catalogue extension for extension-style
     // and named deletion targets (no literal `*`). The original thirteen keep

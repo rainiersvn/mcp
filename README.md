@@ -21,7 +21,7 @@ plus a local safety envelope. Node builtins only, no new deps.
 Run from this directory (`mcp/`):
 
 ```sh
-node --test                # full suite, offline — 187 pass / 1 skipped / 0 fail
+node --test                # full suite, offline — 0 fail; the JEV_LIVE block is skipped by default
 node --test jev-battle.test.ts            # battle suite alone (live block skipped)
 JEV_LIVE=1 node --test jev-battle.test.ts # + live 44-scenario network comparison (opt-in)
 node capture-goldens.mjs   # RE-CAPTURE jev-goldens.json from the live endpoint (network! overwrites fixtures)
@@ -52,14 +52,29 @@ MCP config (`opencode.jsonc`) — this is the live block:
 "jev": {
   "type": "local",
   "command": ["bun", "C:/Users/raini/.config/opencode/mcp/jev-server.ts"],
-  "enabled": true,
-  "timeout": 15000
+  "timeout": { "startup": 30000, "catalog": 15000, "execution": 15000 }
 }
 ```
 
-Note the two timeouts that must stay ordered: the wrapper's request budget is
-**10s** (`OVERALL_BUDGET_MS`), the MCP client timeout is **15s**. The ~5s of
-headroom covers transport + serialization.
+Note the timeouts that must stay ordered: the wrapper's request budget is
+**10s** (`OVERALL_BUDGET_MS`), the MCP **execution** timeout is **15s**, and
+**startup** (server spawn) is **30s**. The ~5s of headroom under execution
+covers transport + serialization.
+
+## Two surfaces
+
+The same six tools are reachable two ways:
+
+- **MCP server (canonical):** `mcp/jev-server.ts` exposes all six tools.
+  Reachable from Code Mode as `tools.jev.*` — but **only when the server is
+  registered without `codemode:false`**: `codemode:false` hides it from Code
+  Mode (the incident that prompted this section). Code Mode finds it via
+  `search({query:"jev"})`.
+- **Native TUI wrappers:** `~/.config/opencode/tools/jev*.ts` — all six
+  (`decide`, `route_expert`, `assess_risk`, `batch`, `discover`, `selfcheck`).
+  TUI-only: they are **invisible to Code Mode by design**. They wrap the same
+  core and have **no `isError` channel** — errors are signalled only by the
+  `fallback:true | ` text prefix; match that prefix.
 
 ## The caller's guide
 
@@ -183,10 +198,13 @@ existing key paths keep working.
 
 **The contract: this wrapper never throws.** Every failure — bad input, dead
 network, HTTP error — comes back as a `tools/call` *result* whose text starts
-with the exact prefix **`fallback:true | `** (with `isError:true`). Only four
-codes are real JSON-RPC errors with no text: bad envelope −32600, unparsable
-line −32700, unknown method −32601, unknown tool −32602. **Check the prefix**;
-on `fallback:true`, proceed on your own judgement without retry-spamming.
+with the exact prefix **`fallback:true | `** (with `isError:true`). Five
+codes are real JSON-RPC errors with no fallback text: bad envelope −32600,
+unparsable line −32700, unknown method −32601, unknown tool −32602, and the
+crash-only backstop **−32603** (unhandled rejection/exception handlers; plain
+message, never `fallback:true | ` text — so the prefix contract still holds).
+**Check the prefix**; on `fallback:true`, proceed on your own judgement
+without retry-spamming.
 
 | Failure | What you see | What to do |
 |---|---|---|
@@ -227,7 +245,7 @@ cache only 60s.
 ## Testing & the overfitting story
 
 ```sh
-node --test   # 187 pass / 1 skipped / 0 fail; the 1 skip is the JEV_LIVE block
+node --test   # full offline suite — 0 fail; the JEV_LIVE block is skipped by default
 ```
 
 - **Golden fixtures + shape contract** (`jev-goldens.json`, captured 2026-10-12

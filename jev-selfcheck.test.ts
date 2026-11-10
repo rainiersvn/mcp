@@ -82,6 +82,29 @@ describe("selfcheck offline (JEV_SELFCHECK_LIVE=0 / live:false)", () => {
     assert.ok(typeof p.model === "string" && typeof p.version === "string");
   });
 
+  test("catalogue_ok is additive: true when healthy, false when DEGRADED — `ok` unchanged", async () => {
+    const p = JSON.parse(await selfcheck({ live: false })) as Record<string, unknown>;
+    assert.equal(p.catalogue_ok, true, "healthy catalogue must read catalogue_ok:true");
+    const broken = {
+      name: "selfcheck-test-broken",
+      why: "test-only broken family",
+      pattern: {
+        test: (_s: string): boolean => {
+          throw new Error("boom");
+        },
+      },
+    } as never;
+    DESTRUCTIVE_PATTERNS.push(broken);
+    try {
+      const p2 = JSON.parse(await selfcheck({ live: false })) as Record<string, unknown>;
+      assert.equal(p2.ok, true, "`ok` semantics unchanged: a degraded catalogue is still a successful diagnosis");
+      assert.equal(p2.catalogue_ok, false, "degraded catalogue must read catalogue_ok:false");
+      assert.match(String(p2.catalogue), /DEGRADED/);
+    } finally {
+      DESTRUCTIVE_PATTERNS.pop();
+    }
+  });
+
   test("env JEV_SELFCHECK_LIVE=0 alone forces offline even with default deps", async () => {
     await withEnv({ JEV_SELFCHECK_LIVE: "0" }, async () => {
       let calls = 0;
