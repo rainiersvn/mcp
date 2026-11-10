@@ -119,9 +119,11 @@ const VARIANTS_PROP = {
 const GOTCHA_422 = `questions is an object map, never an array (array->422).`
 // Accuracy note: known-tool failures (argument-validation AND upstream /
 // execution failures) always come back as a *result* whose content[0].text
-// starts "fallback:true | " with isError:true. Only these four codes are real
-// JSON-RPC errors with no text: bad envelope -32600, unparsable line -32700,
-// unknown method -32601, unknown tool -32602.
+// starts "fallback:true | " with isError:true. Five codes are real JSON-RPC
+// errors with no fallback text: bad envelope -32600, unparsable line -32700,
+// unknown method -32601, unknown tool -32602, and crash-only -32603 (the
+// unhandledRejection / uncaughtException / handle backstops below) — it
+// carries a plain message, never fallback text, so the prefix contract holds.
 const FALLBACK = `Failures: fallback:true, isError:true.`
 
 // All six tools are read-only, idempotent, non-destructive. Only discover is

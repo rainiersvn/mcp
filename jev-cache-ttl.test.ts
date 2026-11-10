@@ -174,3 +174,94 @@ describe("TTL is decided by question type (pure-choice alone gets 6h)", () => {
     assert.ok(JSON.stringify(payload).length <= 1400, "discover budget holds");
   });
 });
+
+describe("(A) a 200 that yields no parseable answer is served but NEVER cached", () => {
+  test("shape-drifted body refetches on the next call; a parseable body still caches", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    let t = 64_000_000;
+    const now = () => t;
+    let driftCalls = 0;
+    const driftDeps = {
+      fetchImpl: async () => {
+        driftCalls++;
+        return new Response(JSON.stringify({ content: [{ type: "text", text: "drifted shape" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      token: "tok-test",
+      now,
+      sleep: async (_ms: number) => {},
+      rng: () => 0,
+    };
+    const q = riskQuestions();
+    const r1 = await decide("drift-not-cached-state", q, driftDeps);
+    const r2 = await decide("drift-not-cached-state", q, driftDeps);
+    assert.ok(!r1.startsWith(FALLBACK_PREFIX), r1.slice(0, 120));
+    assert.ok(!r2.startsWith(FALLBACK_PREFIX), r2.slice(0, 120));
+    assert.equal(driftCalls, 2, "shape-drifted 200 must not live in the cache as a success");
+    // Control: the same double call with a parseable body stays cached.
+    let okCalls = 0;
+    const okDeps = {
+      fetchImpl: async () => {
+        okCalls++;
+        return new Response(
+          JSON.stringify({ answers: { needs_review: { type: "score", score: 1.5, confidence: 0.9 } } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+      token: "tok-test",
+      now,
+      sleep: async (_ms: number) => {},
+      rng: () => 0,
+    };
+    await decide("drift-control-state", q, okDeps);
+    await decide("drift-control-state", q, okDeps);
+    assert.equal(okCalls, 1, "parseable 200 must still cache (60s TTL for score questions)");
+  });
+
+  test("mixed scalar+non-scalar drift body is NOT cached; legacy flat body still is", async () => {
+    _clearJevCache();
+    _clearBearerCache();
+    let t = 65_000_000;
+    const now = () => t;
+    // Pure-choice questions: a wrongly-cached drift entry would live 6h.
+    const q = { expert: { type: "choice", instructions: "pick", criteria: { a: "A", b: "B" } } };
+    let mixedCalls = 0;
+    const mixedDeps = {
+      fetchImpl: async () => {
+        mixedCalls++;
+        return new Response(JSON.stringify({ status: "ok", content: ["x"] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      token: "tok-test",
+      now,
+      sleep: async (_ms: number) => {},
+      rng: () => 0,
+    };
+    await decide("mixed-drift-state", q, mixedDeps);
+    await decide("mixed-drift-state", q, mixedDeps);
+    assert.equal(mixedCalls, 2, "mixed scalar+non-scalar drift body must NOT be cached");
+    // Control: legacy flat answer map {expert:"planner"} (all root scalars) still caches.
+    let legacyCalls = 0;
+    const legacyDeps = {
+      fetchImpl: async () => {
+        legacyCalls++;
+        return new Response(JSON.stringify({ expert: "planner" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      token: "tok-test",
+      now,
+      sleep: async (_ms: number) => {},
+      rng: () => 0,
+    };
+    await decide("legacy-flat-state", q, legacyDeps);
+    await decide("legacy-flat-state", q, legacyDeps);
+    assert.equal(legacyCalls, 1, "legacy flat body {expert:'planner'} must still be cached");
+  });
+});

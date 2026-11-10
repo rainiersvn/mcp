@@ -98,6 +98,35 @@ describe("validateQuestions", () => {
     assert.equal(typeof validateQuestions(null), "string");
   });
 
+  test("rejects BigInt criteria (would crash canonicalJson with a serialize error)", () => {
+    const problem = validateQuestions({
+      needs_review: { type: "score", instructions: "rate", criteria: ["lo", 1n] },
+    });
+    assert.equal(typeof problem, "string");
+    assert.match(problem as string, /BigInt/i);
+  });
+
+  test("rejects circular criteria (would crash JSON.stringify)", () => {
+    const crit: Record<string, unknown> = { lo: "light" };
+    crit.self = crit;
+    const problem = validateQuestions({
+      expert: { type: "choice", instructions: "pick", criteria: crit },
+    });
+    assert.equal(typeof problem, "string");
+    assert.match(problem as string, /circular/i);
+  });
+
+  test("accepts shared non-circular references (JSON.stringify handles those)", () => {
+    const shared = { a: "A" };
+    assert.equal(
+      validateQuestions({
+        expert: { type: "choice", instructions: "pick", criteria: { x: shared, y: shared } },
+        needs_review: { type: "score", instructions: "rate", criteria: ["lo", "hi"] },
+      }),
+      null,
+    );
+  });
+
   test("accepts the shipped default shapes and bare noul", () => {
     assert.equal(validateQuestions(defaultQuestions()), null);
     assert.equal(validateQuestions(riskQuestions()), null);
